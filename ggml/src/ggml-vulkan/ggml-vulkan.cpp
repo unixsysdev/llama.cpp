@@ -4141,6 +4141,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
     }
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    {
+        // 64x64 key/token tiles on 16x16x16 f16 MMAs, four wave64 subgroups per workgroup
+        const bool sg64 = device->subgroup_size_control ? device->subgroup_min_size <= 64 && 64 <= device->subgroup_max_size
+                                                        : device->subgroup_size == 64;
+        if (device->coopmat_support && device->coopmat_support_16x16x16_f32acc && sg64 &&
+            getenv("GGML_VK_DISABLE_LIGHTNING_INDEXER_COOPMAT") == nullptr) {
+            for (ggml_type k_type : lightning_indexer_k_types) {
+                const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32_cm1";
+                ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm1_f32[k_type], name.c_str(), lightning_indexer_f32_cm1_len, lightning_indexer_f32_cm1_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true, true, 64);
+            }
+        }
+    }
+#endif
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
@@ -10250,6 +10264,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_LIGHTNING_INDEXER:
         // only the k type selects a pipeline, the other types are fixed by ggml_lightning_indexer()
         if (ggml_vk_lightning_indexer_k_type_supported(src1->type)) {
+            // the 64-token coopmat tile only pays off for prompt batches; decode and draft verification stay scalar
+            if (ctx->device->pipeline_lightning_indexer_cm1_f32[src1->type] && src0->ne[2] > 16) {
+                return ctx->device->pipeline_lightning_indexer_cm1_f32[src1->type];
+            }
             return ctx->device->pipeline_lightning_indexer_f32[src1->type];
         }
         return nullptr;
@@ -11323,9 +11341,11 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t n_streams = q->ne[3];
     const uint32_t n_masks   = m->ne[3];
 
-    // one workgroup per tile of 64 keys and 8 tokens, see lightning_indexer.comp
+    // one workgroup per tile of 64 keys and 8 tokens (lightning_indexer.comp)
+    // or 64 keys and 64 tokens (lightning_indexer_cm1.comp)
+    const bool cm1 = pipeline == ctx->device->pipeline_lightning_indexer_cm1_f32[k->type];
     const uint32_t n_tiles_kv = CEIL_DIV(n_kv, 64);
-    const uint32_t n_tiles_t  = CEIL_DIV(n_tokens, 8);
+    const uint32_t n_tiles_t  = CEIL_DIV(n_tokens, cm1 ? 64 : 8);
 
     // q, w and dst are f32 and m is f16, so their strides are passed in elements;
     // k may be quantized, so its strides stay in bytes

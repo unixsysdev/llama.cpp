@@ -1,0 +1,184 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+#define BINDING_IDX_K 0u
+
+#include "types.glsl"
+#include "fa_types.glsl"
+#define FaTypeV GGML_TYPE_F32
+
+layout(constant_id = 0) const uint FaTypeK = GGML_TYPE_F32;
+layout(constant_id = 1) const uint FaBlockBytesK = 4;
+
+#include "flash_attn_dequant.glsl"
+
+// Cooperative-matrix version of lightning_indexer.comp.
+//
+// One workgroup scores a tile of BK keys against BT tokens. The key tile is staged once (as f16),
+// then for every indexer head the query tile is staged, the BK x BT dot products are computed with
+// 16x16x16 f16 MMAs (f32 accumulation) and spilled to shared memory, and every invocation adds
+// relu(qk) * weight[head, token] into the scores it owns. Four subgroups of 64: subgroup g computes
+// keys [16g, 16g + 16) against all BT tokens. The scores are kept key-major so that the shared
+// memory reads and the final global writes are contiguous along the key dimension.
+#define HEAD_SIZE 128
+#define BK        64
+#define BT        64
+#define SG_SIZE   64
+#define N_SG      (BK / 16)
+#define WG_SIZE   (N_SG * SG_SIZE)
+#define EPT       (BK * BT / WG_SIZE)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QBuf { float q[]; };
+layout(binding = 1) readonly buffer KBufF16 { float16_t k_f16[]; };
+layout(binding = 1) readonly buffer KBufF32 { float k_f32[]; };
+layout(binding = 1) readonly buffer KBufBF16 { uint16_t k_bf16[]; };
+layout(binding = 2) readonly buffer WBuf { float weights[]; };
+layout(binding = 3) readonly buffer MBuf { float16_t mask[]; };
+layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_kv;
+    uint n_heads;
+    uint n_tokens;
+    uint n_masks;
+    uint q_nb1;
+    uint q_nb2;
+    uint q_nb3;
+    uint k_nb2;
+    uint k_nb3;
+    uint w_nb1;
+    uint w_nb3;
+    uint m_nb1;
+    uint m_nb3;
+    uint d_nb1;
+    uint d_nb3;
+};
+
+// strides in f16vec4 units, padded by two vec4 against bank conflicts
+const uint KQ_STRIDE = HEAD_SIZE / 4 + 2;
+// qk tile stored token-major: element (key, token) at token * S_STRIDE + key
+const uint S_STRIDE  = BK + 4;
+
+shared f16vec4 k_sh[BK * KQ_STRIDE];
+shared f16vec4 q_sh[BT * KQ_STRIDE];
+shared float   s_sh[BT * S_STRIDE];
+shared float   w_sh[BT];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg  = gl_SubgroupID;
+    const uint ik0 = gl_WorkGroupID.x * BK;
+    const uint t0  = gl_WorkGroupID.y * BT;
+    const uint s   = gl_WorkGroupID.z;
+
+    if (fa_type_needs_shmem(FaTypeK)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+
+    // k strides come in as bytes, so scale them down to the view being indexed
+    const uint k_block_elems = fa_block_elems(FaTypeK);
+    const uint k_elem_bytes = FaBlockBytesK / k_block_elems;
+
+    // stage the key tile four elements at a time, rows past n_kv are zero
+    [[unroll]] for (uint i = tid; i < BK * HEAD_SIZE / 4; i += WG_SIZE) {
+        const uint r = i / (HEAD_SIZE / 4);
+        const uint c4 = i % (HEAD_SIZE / 4);
+
+        vec4 v = vec4(0.0);
+        if (ik0 + r < n_kv) {
+            const uint k_offset = (ik0 + r) * k_nb2 + s * k_nb3;
+            const uint e = k_offset / k_elem_bytes + c4 * 4;
+
+            if (FaTypeK == GGML_TYPE_F16) {
+                v = vec4(k_f16[e], k_f16[e + 1], k_f16[e + 2], k_f16[e + 3]);
+            } else if (FaTypeK == GGML_TYPE_F32) {
+                v = vec4(k_f32[e], k_f32[e + 1], k_f32[e + 2], k_f32[e + 3]);
+            } else if (FaTypeK == GGML_TYPE_BF16) {
+                v = bf16_to_fp32(uvec4(k_bf16[e], k_bf16[e + 1], k_bf16[e + 2], k_bf16[e + 3]));
+            } else {
+                v = dequantize4((c4 * 4) / k_block_elems, (c4 * 4) % k_block_elems, k_offset / FaBlockBytesK, BINDING_IDX_K);
+            }
+        }
+
+        k_sh[r * KQ_STRIDE + c4] = f16vec4(v);
+    }
+
+    float score[EPT];
+    [[unroll]] for (uint j = 0; j < EPT; ++j) {
+        score[j] = 0.0;
+    }
+
+    for (uint h = 0; h < n_heads; ++h) {
+        // the previous head is fully consumed and, on the first pass, the key tile is complete
+        barrier();
+
+        [[unroll]] for (uint i = tid; i < BT * HEAD_SIZE / 4; i += WG_SIZE) {
+            const uint r = i / (HEAD_SIZE / 4);
+            const uint c4 = i % (HEAD_SIZE / 4);
+            const uint t = t0 + r;
+
+            vec4 v = vec4(0.0);
+            if (t < n_tokens) {
+                const uint q_base = h * q_nb1 + t * q_nb2 + s * q_nb3 + c4 * 4;
+                v = vec4(q[q_base], q[q_base + 1], q[q_base + 2], q[q_base + 3]);
+            }
+            q_sh[r * KQ_STRIDE + c4] = f16vec4(v);
+        }
+
+        if (tid < BT) {
+            const uint t = t0 + tid;
+            w_sh[tid] = t < n_tokens ? weights[h + t * w_nb1 + s * w_nb3] : 0.0;
+        }
+
+        barrier();
+
+        // qk[key, token] for keys [16 sg, 16 sg + 16) and all BT tokens
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[BT / 16];
+        [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
+            acc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+
+        [[unroll]] for (uint kk = 0; kk < HEAD_SIZE / 16; ++kk) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ka;
+            coopMatLoad(ka, k_sh, (sg * 16) * KQ_STRIDE + kk * 4, KQ_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
+                // B[dim, token] = q_sh[token][dim]: column-major with the token as the column
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> qb;
+                coopMatLoad(qb, q_sh, (c * 16) * KQ_STRIDE + kk * 4, KQ_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                acc[c] = coopMatMulAdd(ka, qb, acc[c]);
+            }
+        }
+
+        // column-major store: element (key, token) lands at token * S_STRIDE + key
+        [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
+            coopMatStore(acc[c], s_sh, (c * 16) * S_STRIDE + sg * 16, S_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+
+        barrier();
+
+        [[unroll]] for (uint j = 0; j < EPT; ++j) {
+            const uint e = j * WG_SIZE + tid;
+            const uint kl = e % BK;
+            const uint tl = e / BK;
+            score[j] += max(s_sh[tl * S_STRIDE + kl], 0.0) * w_sh[tl];
+        }
+    }
+
+    [[unroll]] for (uint j = 0; j < EPT; ++j) {
+        const uint e = j * WG_SIZE + tid;
+        const uint ik = ik0 + e % BK;
+        const uint t = t0 + e / BK;
+        if (ik < n_kv && t < n_tokens) {
+            const uint mask_offset = ik + t * m_nb1 + (s % n_masks) * m_nb3;
+            dst[ik + t * d_nb1 + s * d_nb3] = score[j] + float(mask[mask_offset]);
+        }
+    }
+}
