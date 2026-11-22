@@ -1,0 +1,16 @@
+{
+ "upstream master": {
+  "other": 1578.0,
+  "attention": 6338.1,
+  "indexer + top-k + mask": 1519.8,
+  "dense matmul": 2292.1,
+  "expert matmul": 1746.4
+ },
+ "this branch": {
+  "other": 1592.9,
+  "attention": 859.4,
+  "indexer + top-k + mask": 643.5,
+  "dense matmul": 2281.3,
+  "expert matmul": 1599.1
+ }
+}

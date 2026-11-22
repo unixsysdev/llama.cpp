@@ -1,0 +1,8 @@
+Correctness checks (llama.cpp 8d60873df + this branch, Vulkan0 = Radeon 8060S, RADV, Mesa 26.2.5)
+
+test-backend-ops -b Vulkan0 -o FLASH_ATTN_EXT    -> 5693/5693 tests passed (sparse prefill threshold 4x)
+test-backend-ops -b Vulkan0 -o LIGHTNING_INDEXER -> 210/210 tests passed (coopmat kernel for > 16 tokens)
+
+llama-perplexity, Qwen3.8-Flash-Next UD-IQ4_XS, first 32768 tokens of code_1300k.txt (llama.cpp sources), -c 32768 -b 4096 -ub 4096:
+  sparse prefill on : Final estimate: PPL = 1.2287 +/- 0.00981
+  sparse prefill off: Final estimate: PPL = 1.2285 +/- 0.00980

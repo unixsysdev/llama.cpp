@@ -1,3 +1,8 @@
+> **This fork:** a branch for running Qwen3.8-Flash-Next with long contexts on AMD Strix Halo (Vulkan).
+> Prompt processing at 128K context goes from 301 to 571 tokens/s, and a 250K-token prompt takes 7.9 minutes instead of 11.2.
+> Read [strix-halo/README.md](strix-halo/README.md) for the changes and setup, and [strix-halo/REPORT.md](strix-halo/REPORT.md) for the measurements.
+> Everything below this note is the upstream llama.cpp README.
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)

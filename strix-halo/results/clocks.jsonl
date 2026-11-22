@@ -1,0 +1,8 @@
+{"label": "abl-master-r1", "samples": 324, "sclk_median": 2413.0, "sclk_min": 1069, "temp_max": 82, "load_after": 2.38}
+{"label": "abl-sparse-r1", "samples": 264, "sclk_median": 2396.5, "sclk_min": 1264, "temp_max": 81, "load_after": 4.14}
+{"label": "abl-indexer-r1", "samples": 323, "sclk_median": 2365, "sclk_min": 1377, "temp_max": 82, "load_after": 4.49}
+{"label": "abl-both-r1", "samples": 309, "sclk_median": 2365, "sclk_min": 1074, "temp_max": 80, "load_after": 2.32}
+{"label": "abl-both-r2", "samples": 86, "sclk_median": 2342.5, "sclk_min": 1321, "temp_max": 80, "load_after": 3.93}
+{"label": "abl-indexer-r2", "samples": 87, "sclk_median": 2362, "sclk_min": 924, "temp_max": 79, "load_after": 2.19}
+{"label": "abl-sparse-r2", "samples": 83, "sclk_median": 2355, "sclk_min": 1359, "temp_max": 83, "load_after": 3.14}
+{"label": "abl-master-r2", "samples": 88, "sclk_median": 2355.5, "sclk_min": 1110, "temp_max": 82, "load_after": 4.75}

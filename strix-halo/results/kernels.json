@@ -1,0 +1,64 @@
+{
+ "attention": [
+  {
+   "kv": 8192,
+   "dense_us": 6311.62,
+   "sparse_us": 6341.1
+  },
+  {
+   "kv": 16384,
+   "dense_us": 13356.56,
+   "sparse_us": 6635.08
+  },
+  {
+   "kv": 32768,
+   "dense_us": 27943.81,
+   "sparse_us": 8147.41
+  },
+  {
+   "kv": 131072,
+   "dense_us": 101577.8,
+   "sparse_us": 10998.84
+  }
+ ],
+ "indexer": [
+  {
+   "kv": 4096,
+   "nb": 512,
+   "scalar_us": 1393.16,
+   "coopmat_us": 284.6
+  },
+  {
+   "kv": 4096,
+   "nb": 2048,
+   "scalar_us": 5527.62,
+   "coopmat_us": 1263.81
+  },
+  {
+   "kv": 65536,
+   "nb": 512,
+   "scalar_us": 22168.67,
+   "coopmat_us": 5298.22
+  },
+  {
+   "kv": 65536,
+   "nb": 2048,
+   "scalar_us": 88375.58,
+   "coopmat_us": 21007.02
+  }
+ ],
+ "indexer_decode": [
+  {
+   "kv": 4096,
+   "nb": 1,
+   "scalar_us": 29.79,
+   "selected_us": 29.7
+  },
+  {
+   "kv": 65536,
+   "nb": 1,
+   "scalar_us": 355.18,
+   "selected_us": 356.16
+  }
+ ]
+}
