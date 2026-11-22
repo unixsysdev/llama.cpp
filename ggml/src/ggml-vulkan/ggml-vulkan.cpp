@@ -9105,7 +9105,29 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // Sparse prefill: a prompt batch whose mask carries an n_kv_max hint (QSA/DSA top-k selection) attends to at most
+    // n_kv_max positions per query row. Fold the query heads of each KV head into the rows, as for decode, so every
+    // token gathers only its own compacted positions instead of running dense attention over the whole cache.
+    bool sparse_prefill = false;
+    {
+        static const bool disable = getenv("GGML_VK_FA_SPARSE_PREFILL_DISABLE") != nullptr;
+        static const int64_t min_ratio = [] {
+            const char * s = getenv("GGML_VK_FA_SPARSE_PREFILL_RATIO");
+            return s ? std::max<int64_t>(1, atoll(s)) : 4;
+        }();
+        const int32_t hint = mask ? ggml_get_op_params_i32(dst, 4) : 0;
+        float bias, softcap;
+        memcpy(&bias,    (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+        // the sparse path below needs a 16x reduction for quantized K/V; never fold without taking it
+        const bool kv16 = k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16;
+        const int64_t ratio = kv16 ? min_ratio : std::max<int64_t>(min_ratio, 16);
+        sparse_prefill = !disable && N > 8 && hint > 0 && mask && mask->ne[0] == (int64_t)KV &&
+                         bias == 0.0f && softcap == 0.0f && tuning_params.path != FA_COOPMAT2 &&
+                         (int64_t)KV >= std::max<int64_t>(4096, ratio * (int64_t)hint);
+    }
+
+    if ((N <= 8 || sparse_prefill) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
