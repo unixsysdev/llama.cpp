@@ -14458,6 +14458,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048, true));
         }
     }
+    // Qwen3.8 QSA prompt batch: top 512 of the pooled blocks for 1024 tokens (8K / 32K / 128K context)
+    for (auto cols : {2048, 8192, 32768}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 1024, 1, 1}, 512));
+    }
     for (int n_tps : {1, 16, 64}) {
         test_cases.emplace_back(new test_topk_qsa(516, 33024, n_tps, 1, 2051, true));
         test_cases.emplace_back(new test_topk_qsa(2064, 132096, n_tps, 1, 2051, true));

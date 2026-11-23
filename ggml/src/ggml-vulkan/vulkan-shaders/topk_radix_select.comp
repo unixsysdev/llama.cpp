@@ -183,6 +183,12 @@ void topk(const uint row) {
         prefix  |= sh_bucket << uint(shift);
         desired -= sh_above;
         barrier();
+
+        // the boundary bucket is needed whole: every key at or above the prefix (low bits zero) is selected,
+        // so the remaining passes cannot change the result (sh_tied and desired are uniform here)
+        if (sh_tied == desired) {
+            break;
+        }
     }
 
     const uint threshold = prefix;
