@@ -1,108 +1,93 @@
-> **This fork:** a branch for running Qwen3.8-Flash-Next with long contexts on AMD Strix Halo (Vulkan).
-> Prompt processing at 128K context goes from 301 to 571 tokens/s, and a 250K-token prompt takes 7.9 minutes instead of 11.2.
-> Read [strix-halo/README.md](strix-halo/README.md) for the changes and setup, and [strix-halo/REPORT.md](strix-halo/REPORT.md) for the measurements.
-> Everything below this note is the upstream llama.cpp README.
+# Dr. Sparselove: Qwen3.8-Flash-Next at 256K context on AMD Strix Halo
 
-# llama.cpp
+**Paper:** [Dr. Sparselove, or: How I Learned to Stop Worrying and Love the 256K Context](strix-halo/REPORT.md). It has the profiles, kernel timings, ablations and the things that didn't work.
 
-![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
+This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). This branch makes long-context prompt processing of Qwen3.8-Flash-Next much faster on the Vulkan backend. It also contains the setup I use to run the model on a Ryzen AI Max+ 395 box with 128 GB, with the measurements behind every setting.
 
-<div align="center">
+The model uses sparse attention: each query attends to at most 2,051 positions chosen by a small indexer. While processing a prompt, upstream Vulkan ran this as dense attention over the entire cache with a mask on top. The deeper the context, the worse it got. This branch sends prompt batches through the sparse path that the backend already had for decoding, and gives the indexer a cooperative-matrix kernel.
 
-<b>LLM inference in C/C++</b>
+| | upstream | this branch |
+|---|---:|---:|
+| prompt processing, empty cache | 702 tok/s | 697 tok/s (no change) |
+| prompt processing, 32K already in cache | 481 tok/s | 623 tok/s |
+| prompt processing, 128K already in cache | 301 tok/s | 571 tok/s |
+| one 250K-token prompt, end to end | 11.2 min | 7.9 min |
+| next turn at 250K: 2K new tokens | 8.2 s | 5.0 s |
+| decode, no drafting | 26.6 tok/s | 26.3 tok/s |
+| decode, MTP drafting (effort xhigh) | 34.7 tok/s | 34.5 tok/s |
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+Outputs are the same: all 5,693 flash-attention and 210 indexer backend tests pass, and perplexity matches within noise. Decode speed doesn't change. On upstream I also measured 43 tok/s at `low` reasoning effort, and about 100 tok/s when the model rewrites a file it was given (MTP + n-gram drafting).
 
-[v1.0.0](https://huggingface.co/blog/ggml-org/llama-cpp-v1) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+![prompt processing vs depth](strix-halo/figures/prefill_vs_depth.png)
 
-</div>
+The full story is in the paper, [strix-halo/REPORT.md](strix-halo/REPORT.md).
 
-## Description
+## The changes
 
-The main goal of `llama.cpp` is to enable LLM (and MLLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in the cloud.
+The code changes are two commits on top of upstream master `8d60873df`.
 
-The `llama.cpp` project is built on top of the [ggml](https://github.com/ggml-org/ggml) library.
+`vulkan: use sparse flash attention for prompt batches` touches `ggml-vulkan.cpp`. The sparse attention path (compact each row's selected positions, then gather only those K/V rows) was only reachable for batches of up to 8 rows. Now prompt batches with a sparse-mask hint use it too, once the cache is at least 4x the selection (16x for quantized K/V). The kernel is 2x faster at 16K, 3.4x at 32K and 9.2x at 128K.
 
-## Quick start
+`vulkan: cooperative matrix lightning indexer` adds `lightning_indexer_cm1.comp`, which computes 64x64 key/token tiles with 16x16x16 f16 MMAs. It's 4.2-4.9x faster than the scalar shader, which is still used for 16 tokens or fewer.
 
-A few options to get `llama.cpp` installed on your machine:
+Both can be switched off at runtime: `GGML_VK_FA_SPARSE_PREFILL_DISABLE=1` and `GGML_VK_DISABLE_LIGHTNING_INDEXER_COOPMAT=1`. `GGML_VK_FA_SPARSE_PREFILL_RATIO=<n>` changes the threshold.
+
+## Running it
+
+First, let the GPU use most of the memory. amdgpu allows 62 GB by default, which is less than the weights. Add these to the kernel command line and reboot:
+
+```
+amdgpu.gttsize=126976 ttm.pages_limit=32505856
+```
+
+On Limine (Omarchy, for example), append them to `KERNEL_CMDLINE[default]` in `/etc/default/limine` and run `limine-update`. `cat /sys/class/drm/card*/device/mem_info_gtt_total` should then print about 133 GB. Many Strix Halo guides also add `amd_iommu=off`; it helps a little, but it switches off IOMMU DMA protection.
+
+Build (needs the Vulkan headers and `glslc`):
 
 ```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
+cmake -S . -B build-vulkan -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan -j --target llama-server llama-bench
 ```
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+Download the model, about 98 GB. On my connection `aria2c` was a lot faster than the Hugging Face client:
 
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+M=~/models/qwen3.8-flash-next; mkdir -p $M/UD-IQ4_XS
+for i in 1 2 3 4; do echo "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-0000$i-of-00004.gguf"; echo "  dir=$M/UD-IQ4_XS"; done > dl.txt
+echo "https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF/resolve/main/mtp-Qwen3.8-Flash-Next-Q8_0.gguf" >> dl.txt; echo "  dir=$M" >> dl.txt
+aria2c -i dl.txt -j 2 -x 16 -s 16 -k 16M -c
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Llama Chat, the built-in chat app, against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Llama Chat, the built-in chat app, against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Then start the server with [`strix-halo/launch/qwen38.sh`](strix-halo/launch/qwen38.sh). It serves the web UI and the OpenAI-compatible API on http://127.0.0.1:8081:
 
-## Documentation
+```bash
+MODEL_DIR=~/models/qwen3.8-flash-next strix-halo/launch/qwen38.sh
+```
 
-#### Tools
+The defaults in that script, and why:
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [Text-to-speech (TTS) models](docs/multimodal/tts.md)
-- [GBNF grammars](grammars/README.md)
+| setting | reason |
+|---|---|
+| `-c 262144` | the full native context. 36 of the 48 layers are linear attention, so an f16 cache for all 256K is only about 7 GB |
+| `-lm mmap` | keeps the 28.8 GB n-gram table in the page cache. Other load modes copy it into process memory |
+| `-b 4096 -ub 4096` | 30% faster prompts than the default 512 |
+| `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 2 --spec-draft-sampling probabilistic` | MTP with 2-token drafts is the fastest general setting. The n-gram drafter costs about 5% on text that doesn't repeat and more than doubles the speed when the model rewrites code it has seen; `NGRAM=0` turns it off |
+| T 1.0, top-p 0.95, top-k 20 | Qwen's recommended sampling for thinking mode |
 
-#### Development
+`EFFORT=low|medium|xhigh` changes the default reasoning effort, `THINK=0` turns thinking off and `DRAFT=0` turns drafting off.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+## Reproducing the numbers
 
-## Contributing
+All the numbers come from the scripts in [`strix-halo/scripts/`](strix-halo/scripts/), and the raw output is in [`strix-halo/results/`](strix-halo/results/). `python3 strix-halo/scripts/plots.py` redraws the figures (it needs matplotlib).
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+```bash
+BASE_BIN=/path/to/upstream/build-vulkan/bin MODEL_DIR=~/models/qwen3.8-flash-next strix-halo/scripts/ablation.sh
+cmake -S . -B build-vulkan -DLLAMA_BUILD_TESTS=ON && cmake --build build-vulkan -j --target test-backend-ops
+python3 strix-halo/scripts/kernels.py ./build-vulkan/bin/test-backend-ops kernels.json
+```
 
-## Acknowledgements
+If you run them on a Strix Halo machine, keep it idle. The CPU and GPU share one power budget, and anything busy on the CPU lowers the GPU clock. `ablation.sh` waits for a quiet machine and logs the clock for that reason.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+## About this fork
+
+Apart from the two Vulkan commits and the `strix-halo/` folder, everything here is upstream llama.cpp at `8d60873df`. For everything else, see the [llama.cpp README](https://github.com/ggml-org/llama.cpp#readme) and [`docs/`](docs/). The license is upstream's MIT license ([LICENSE](LICENSE)).

@@ -146,7 +146,7 @@ Short prompts are no faster than before: still about 700 tokens/s. That is down 
 
 ## Reproducing
 
-[README.md](README.md) has the build, download and launch steps. The numbers come from the scripts in [`scripts/`](scripts/):
+The [README](../README.md) has the build, download and launch steps. The numbers come from the scripts in [`scripts/`](scripts/):
 
 | script | produces |
 |---|---|

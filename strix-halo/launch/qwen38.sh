@@ -5,7 +5,7 @@
 # Model: Unsloth UD-IQ4_XS (93.7 GB: ~65 GB GPU weights + 28.8 GB engram that stays on the CPU, memory-mapped)
 #        + ggml-org MTP head (mtp-...-Q8_0, 4.1 GB) for speculative decoding.
 # Needs the raised GPU memory limit (kernel cmdline: amdgpu.gttsize=126976 ttm.pages_limit=32505856).
-# Binary: this branch (sparse prefill attention + coopmat lightning indexer), see ../README.md and ../REPORT.md.
+# Binary: this branch (sparse prefill attention + coopmat lightning indexer), see README.md at the top of the repo and ../REPORT.md.
 #
 # Measured on this box (Vulkan/RADV, thinking on, T=1.0):
 #   decode: ~27 tok/s plain, ~35 with MTP (xhigh effort), ~43 at low effort, ~100 when re-emitting code (n-gram)
