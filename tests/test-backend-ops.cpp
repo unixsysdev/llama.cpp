@@ -14266,6 +14266,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
     }
 
+    // Qwen3.8-Flash-Next prompt-batch matmuls (4096-token ubatch); experts scaled to 128 with the same ~80 rows each
+    for (ggml_type ta : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 4, 4096, 10240, {1, 1}, {1, 1}));      // hc inject
+        test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, 324, 4096, 10240, {1, 1}, {1, 1}));    // hc down | inject
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4096, 4, 10240, {1, 1}, {1, 1}));    // hc inject, transposed
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 4096, 2560, {1, 1}, {1, 1}));    // router
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, 4096, 2560, {1, 1}, {1, 1}));     // ssm alpha, beta
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, 4096, 10240, {1, 1}, {1, 1}));  // hc down
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 4096, 320, {1, 1}, {1, 1}));  // hc up
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 4096, 6144, {1, 1}, {1, 1}));  // ssm out
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 4096, 2560, {1, 1}, {1, 1})); // attn qkv
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 4096, 2560, {1, 1}, {1, 1}));  // attn gate
+    for (ggml_type ta : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_S}) {
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 128, 10, true, 640, 1024, 2560));        // expert gate, up
+    }
+    for (ggml_type ta : {GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 128, 10, false, 2560, 1024, 640));       // expert down
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

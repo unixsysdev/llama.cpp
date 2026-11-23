@@ -209,6 +209,45 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     }
 }
 
+#elif defined(DATA_A_IQ3_XXS)
+
+// 32 values per block: 8 grid indices (4 magnitudes each, 4..62), one word of 4 x 7 sign bits and a 4-bit scale.
+// Each loadr takes 8 consecutive values: grid indices 2*loadr, 2*loadr+1 and the loadr-th sign group.
+struct block_a_prefetch {
+    uint32_t idx;  // two grid indices
+    uint32_t aux;  // sign groups | scale << 28
+    float16_t d;
+};
+
+block_a_prefetch block_a_load(uint ib, uint loadr) {
+    block_a_prefetch blk;
+    const uint ib_k = ib / 8;
+    const uint ib32 = ib % 8;
+    blk.idx = uint32_t(data_a_packed16[ib_k].qs[4 * ib32 + loadr]);
+    blk.aux = pack32(u16vec2(data_a_packed16[ib_k].qs[QUANT_K_IQ3_XXS / 8 + 2 * ib32],
+                             data_a_packed16[ib_k].qs[QUANT_K_IQ3_XXS / 8 + 2 * ib32 + 1]));
+    blk.d = data_a_packed16[ib_k].d;
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+    // the eighth sign bit is the parity of the other seven
+    const uint sign7 = bitfieldExtract(blk.aux, 7 * int(loadr), 7);
+    const uint signs = sign7 | ((bitCount(sign7) & 1u) << 7);
+    const ivec4 vals0 = ivec4(unpack8(iq3xxs_grid[blk.idx & 0xFF]));
+    const ivec4 vals1 = ivec4(unpack8(iq3xxs_grid[(blk.idx >> 8) & 0xFF]));
+    // negate with (v ^ -s) - -s, no branches
+    const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
+    const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+
+    if (loadr == 0) {
+        // d * (0.5 + scale) * 0.5
+        buf_a_d[ks * BM + buf_ib] = in_bounds ? float(blk.d) * 0.25f * float(1u + 2u * (blk.aux >> 28)) : 0.0f;
+    }
+}
+
 #elif defined(DATA_A_MXFP4)
 
 struct block_a_prefetch {
