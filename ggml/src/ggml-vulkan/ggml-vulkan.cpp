@@ -9074,6 +9074,27 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     const bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
 
+    // Sparse prefill: a prompt batch whose mask carries an n_kv_max hint (QSA/DSA top-k selection) attends to at most
+    // n_kv_max positions per query row. Fold the query heads of each KV head into the rows, as for decode, so every
+    // token gathers only its own compacted positions instead of running dense attention over the whole cache.
+    static const bool sparse_prefill_disable = getenv("GGML_VK_FA_SPARSE_PREFILL_DISABLE") != nullptr;
+    static const int64_t sparse_prefill_ratio = [] {
+        const char * s = getenv("GGML_VK_FA_SPARSE_PREFILL_RATIO");
+        return s ? std::max<int64_t>(1, atoll(s)) : 4;
+    }();
+    auto use_sparse_prefill = [&](ggml_type k_type, ggml_type v_type, FaCodePath path) {
+        const int32_t hint = mask ? ggml_get_op_params_i32(dst, 4) : 0;
+        float bias, softcap;
+        memcpy(&bias,    (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+        // the sparse path below needs a 16x reduction for quantized K/V; never fold without taking it
+        const bool kv16 = k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16;
+        const int64_t ratio = kv16 ? sparse_prefill_ratio : std::max<int64_t>(sparse_prefill_ratio, 16);
+        return !sparse_prefill_disable && N > 8 && hint > 0 && mask && mask->ne[0] == (int64_t)KV &&
+               bias == 0.0f && softcap == 0.0f && path != FA_COOPMAT2 &&
+               (int64_t)KV >= std::max<int64_t>(4096, ratio * (int64_t)hint);
+    };
+
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
@@ -9092,6 +9113,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                 (k->nb[1] != (uint64_t)HSK * ggml_type_size(k->type) ||
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
+    // the strided copy only speeds up dense reads; a sparse prefill gathers just the selected rows, so copying the
+    // whole cache first would only cost bandwidth (K/V types are unchanged by that copy, so the decision is final)
+    const bool kv_raw_sparse = kv_raw_strided &&
+        use_sparse_prefill(k->type, v->type,
+                           get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k->type, v->type, f32acc, qk_ratio).path);
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
     // K and V share one scratch buffer, so the sum must fit in one allocation
     const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
@@ -9099,7 +9125,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t cm2_min_reuse = KV >= 8192 ? 4096 : 8192;
     // Query reuse must cover the conversion and synchronization cost.
     const bool cm2_dequant_kv = KV >= 4096 && neq1 >= cm2_min_queries && (uint64_t) neq1 * qk_ratio >= cm2_min_reuse;
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && !kv_raw_sparse && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -9119,27 +9145,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    // Sparse prefill: a prompt batch whose mask carries an n_kv_max hint (QSA/DSA top-k selection) attends to at most
-    // n_kv_max positions per query row. Fold the query heads of each KV head into the rows, as for decode, so every
-    // token gathers only its own compacted positions instead of running dense attention over the whole cache.
-    bool sparse_prefill = false;
-    {
-        static const bool disable = getenv("GGML_VK_FA_SPARSE_PREFILL_DISABLE") != nullptr;
-        static const int64_t min_ratio = [] {
-            const char * s = getenv("GGML_VK_FA_SPARSE_PREFILL_RATIO");
-            return s ? std::max<int64_t>(1, atoll(s)) : 4;
-        }();
-        const int32_t hint = mask ? ggml_get_op_params_i32(dst, 4) : 0;
-        float bias, softcap;
-        memcpy(&bias,    (const float *) dst->op_params + 1, sizeof(float));
-        memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
-        // the sparse path below needs a 16x reduction for quantized K/V; never fold without taking it
-        const bool kv16 = k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16;
-        const int64_t ratio = kv16 ? min_ratio : std::max<int64_t>(min_ratio, 16);
-        sparse_prefill = !disable && N > 8 && hint > 0 && mask && mask->ne[0] == (int64_t)KV &&
-                         bias == 0.0f && softcap == 0.0f && tuning_params.path != FA_COOPMAT2 &&
-                         (int64_t)KV >= std::max<int64_t>(4096, ratio * (int64_t)hint);
-    }
+    const bool sparse_prefill = use_sparse_prefill(k_type_eff, v_type_eff, tuning_params.path);
+    GGML_ASSERT(!kv_raw_sparse || sparse_prefill);
 
     if ((N <= 8 || sparse_prefill) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {

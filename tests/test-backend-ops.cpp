@@ -13450,6 +13450,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    // sparse prefill on the model's cache layout (heads interleaved per cell), deep enough to fold the heads
+    for (int64_t nb : {256, 300}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8448, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 2051));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 33024, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, true, false, 2051));
+
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
