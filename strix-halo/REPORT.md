@@ -6,7 +6,7 @@
 
 ## Abstract
 
-Qwen3.8-Flash-Next is a 125B mixture-of-experts model with about 6B active parameters per token, a 51B n-gram embedding table, hybrid Gated-DeltaNet / sparse-attention layers and a 256K native context. It fits on a 128 GB AMD Ryzen AI Max+ 395 ("Strix Halo") in a 4-bit quant. Prompt processing with llama.cpp's Vulkan backend, however, falls off a cliff as the context grows: about 700 tokens/s with an empty cache, under 300 tokens/s at 250K. The reason turned out to be simple. The model's sparse attention lets each query look at no more than 2,051 positions, but during prompt processing the Vulkan backend ran it as ordinary dense attention over the whole cache, with a mask. The indexer that picks those 2,051 positions ran on a scalar kernel. I changed two things: prompt batches now use the sparse attention path the backend already had for decoding, and the indexer got a cooperative-matrix kernel. At 128K context prompt processing goes from 301 to 571 tokens/s (+90%), and a 250K-token prompt now takes 7.9 minutes instead of 11.2. Outputs don't change: the backend tests pass and perplexity is the same within noise. The rest of the report covers the settings that mattered on this machine (memory limits, load mode, batch size, backend, speculative decoding). With MTP drafting the model decodes at about 35 tokens/s at maximum reasoning effort, and with n-gram drafting on top it reaches around 100 tokens/s when it re-emits code it has already seen. A second pass (section 9), prompted by a review of the first version, adds an int8 kernel for the IQ3_XXS experts and trims the hyper-connection and MoE plumbing: prompt processing goes up another 11-12%, to about 810 tokens/s with an empty cache and 641 at 128K.
+Qwen3.8-Flash-Next is a 125B mixture-of-experts model with about 6B active parameters per token, a 51B n-gram embedding table, hybrid Gated-DeltaNet / sparse-attention layers and a 256K native context. It fits on a 128 GB AMD Ryzen AI Max+ 395 ("Strix Halo") in a 4-bit quant. Prompt processing with llama.cpp's Vulkan backend, however, falls off a cliff as the context grows: about 700 tokens/s with an empty cache, under 300 tokens/s at 250K. The reason turned out to be simple. The model's sparse attention lets each query look at no more than 2,051 positions, but during prompt processing the Vulkan backend ran it as ordinary dense attention over the whole cache, with a mask. The indexer that picks those 2,051 positions ran on a scalar kernel. I changed two things: prompt batches now use the sparse attention path the backend already had for decoding, and the indexer got a cooperative-matrix kernel. At 128K context prompt processing goes from 301 to 571 tokens/s (+90%), and a 250K-token prompt now takes 7.9 minutes instead of 11.2. Outputs don't change: the backend tests pass and perplexity is the same within noise. The rest of the report covers the settings that mattered on this machine (memory limits, load mode, batch size, backend, speculative decoding). With MTP drafting the model decodes at about 35 tokens/s at maximum reasoning effort, and with n-gram drafting on top it reaches around 100 tokens/s when it re-emits code it has already seen. A second pass (section 9), prompted by a review of the first version, adds an int8 kernel for the IQ3_XXS experts and trims the hyper-connection and MoE plumbing: prompt processing goes up another 11-12%, to about 810 tokens/s with an empty cache and 641 at 128K. A third pass (section 10) corrects one of those changes and stops writing the dense attention mask: 662 tokens/s at 128K.
 
 ## 1. Setup
 
@@ -154,7 +154,7 @@ After the first version went up, someone read through the two commits and the 12
 | the hyper-connection "inject" matmul (4 outputs per token, 96 per batch) as a matrix-vector product | `MUL_MAT f32 m=4` | 192 → 84 ms |
 | MoE router weights applied to the down projection's input, 4x smaller than its output | `MUL` | 244 → 143 ms |
 | radix top-k stops as soon as the boundary bucket is decided | `TOP_K` | 24-33% less (kernel) |
-| no copy of the whole K/V cache before a sparse prompt batch | `FLASH_ATTN_EXT` | ~2.7 ms per QSA layer at 128K |
+| no copy of the whole K/V cache before a sparse prompt batch (**reverted in section 10**: it made attention slower) | `FLASH_ATTN_EXT` | ~2.7 ms per QSA layer at 128K, but see section 10 |
 
 The first three apply at every context length, the last two only to long ones. The inject matmul is the one the list missed. As a matmul it gets one row of tiles and about 30 workgroups for 40 CUs. With the operands swapped it is a matrix-vector product that reads its input once.
 
@@ -186,7 +186,37 @@ Where an empty-cache batch spends its time now (GPU time, ms):
 | attention | 165 | 164 |
 | everything else | 490 | 476 |
 
-The hyper-connections are next. Fusing the `hc_up` matmul with `DSV4_HC_PRE`, and `HC_POST` with the following `RMS_NORM_MUL`, would save writing and reading the 168 MB residual twice per half-layer. That is 96 times per batch. For long contexts, the biggest open item is still passing the selected indices straight to attention, with no dense mask and no compaction. After that: summing the indexer's four heads in registers, and letting neighbouring tokens share one gather of their mostly overlapping selections.
+The hyper-connections are next. Fusing the `hc_up` matmul with `DSV4_HC_PRE`, and `HC_POST` with the following `RMS_NORM_MUL`, would save writing and reading the 168 MB residual twice per half-layer. That is 96 times per batch. For long contexts, the biggest open item is still passing the selected indices straight to attention, with no dense mask and no compaction. After that: summing the indexer's four heads in registers, and letting neighbouring tokens share one gather of their mostly overlapping selections. Section 10 does most of this.
+
+## 10. A third pass
+
+**A correction first.** Section 9's "no K/V copy" change made attention slower, not faster. On AMD the backend copies the cache into a per-head layout before a prompt batch, and I took the copy out for sparse batches, since they only gather the selected rows anyway. It turns out the layout matters for the gather. Gathering from the per-head copy is faster than gathering from the interleaved cache by more than the copy costs. At 32K, attention takes 670 ms per batch with the copy and 710-740 ms without it. So section 9's 128K figure (641 tok/s) was measured with that regression in. My kernel benchmark missed it: in the test cases with the interleaved layout, K and V are views into a bigger buffer, so neither build makes the copy there. The copy is back (`vulkan: keep the K/V copy for sparse prompt batches`).
+
+Then three changes, two for long contexts and one for every length:
+
+| change | GPU time per 4096-token batch |
+|---|---:|
+| `HC_POST` fused with the next `RMS_NORM` + `MUL`: one pass writes the new residual and its normalized copy | 326 → 291 ms, every depth |
+| the sparse attention index lists built straight from the top-k picks, so `TOP_K_MASK` and the compaction no longer run | 32K: `TOP_K_MASK` 30 → 0 ms, attention 677 → 640 ms |
+| the indexer sums its four heads in registers when their weights are equal (they always are here) | indexer kernel 3.5-6% faster |
+
+The second one is the "pass the indices straight to attention" item from sections 8 and 9. `TOP_K_MASK` wrote a dense `[n_kv x n_tokens]` mask, 1.1 GB per layer at 128K, only for attention to read it back and rebuild per-row lists of at most 2,051 positions. A new kernel builds the same lists from the top-k picks: it marks the kept cells in a bitmap in shared memory and writes them out in ascending order. That is exactly the list the compaction made, so the attention output doesn't change. Attention then runs without reading a mask at all, and a planning pass at the start of each graph skips the `TOP_K_MASK` when nothing else reads it. New tests run `TOP_K_MASK` into attention in one graph, with messy inputs (repeated and out-of-range picks) as well as real ones.
+
+The `HC_POST` fusion saved less than I expected. It removes a 168 MB read per call, about 80 ms per batch at full bandwidth, but the fused kernel runs at about 170 GB/s against about 210 GB/s for the two kernels it replaces.
+
+Single runs, same machine, next day:
+
+| | second round (section 9) | third round |
+|---|---:|---:|
+| empty cache | 811 tok/s | 809 tok/s |
+| 128K already cached | 641 tok/s | 662 tok/s (+3.3%) |
+| decode, 64 tokens, no drafting | 28.3 tok/s (first round build) | 28.7 tok/s |
+
+The empty-cache figure doesn't move: everything in this round except the `HC_POST` fusion (about 0.7%) is for long contexts. Two empty-cache runs I took while the desktop was busy (load 8-9) came in at 695 and 746 tok/s. I left those out.
+
+Perplexity on the same sample is 1.2321, or 1.2300 with the two new attention and `HC_POST` paths switched off. Repeat runs give exactly the same number, so the difference is real but tiny. It's rounding: attention without the mask add compiles slightly differently, and a few near-tie top-k picks come out differently a few layers later. The index lists themselves are the same. Against the CPU reference, the attention output in the new tests has an error of 0.7-1.6e-6 (NMSE) with the new path and without it, where one missing cell would show up as roughly 1e-3. All these perplexities are well inside the ±0.0099 error bar.
+
+What's left looks smaller. Fusing the `hc_up` matmul with `DSV4_HC_PRE` would save one more round trip of the residual. Judging by the `HC_POST` fusion, that's 50-100 ms per batch. Top-k still takes about 250 ms per batch at 128K, and an 11-bit radix (two passes instead of four) might take a fifth of that off. The indexer runs at only about 7 TFLOPS because every key tile re-reads the whole f32 query tile. Attention itself is bound by the bandwidth of its gathers, so the only way to make it much faster is to read less: neighbouring tokens select mostly the same blocks and could share one gather.
 
 ## Reproducing
 

@@ -16,7 +16,7 @@ The model uses sparse attention: each query attends to at most 2,051 positions c
 | decode, no drafting | 26.6 tok/s | 26.3 tok/s |
 | decode, MTP drafting (effort xhigh) | 34.7 tok/s | 34.5 tok/s |
 
-A second pass ([report section 9](strix-halo/REPORT.md#9-a-second-pass)) adds 11-12% on top, measured against the first round on the same day: 731 → 811 tok/s with an empty cache, 574 → 641 tok/s at 128K.
+A second and a third pass ([report sections 9](strix-halo/REPORT.md#9-a-second-pass) and [10](strix-halo/REPORT.md#10-a-third-pass)) add 11% with an empty cache (731 → 809 tok/s) and 15% at 128K (574 → 662 tok/s, 2.2x upstream), measured against the first round on this machine.
 
 Outputs are the same: all 5,693 flash-attention and 210 indexer backend tests pass, and perplexity matches within noise. Decode speed doesn't change. On upstream I also measured 43 tok/s at `low` reasoning effort, and about 100 tok/s when the model rewrites a file it was given (MTP + n-gram drafting).
 
@@ -40,7 +40,16 @@ The second round (report section 9) is five more:
 - `qwen4exp: compute the hc inject weights as a matrix-vector product`: a matmul with 4 outputs per token, 96 times per batch, was using one row of tiles.
 - `llama-graph: weight the MoE experts before the down projection (qwen4exp)`: the router weights now scale the down projection's input, which is a quarter the size of its output.
 - `vulkan: end the radix top-k once the boundary bucket is decided`
-- `vulkan: skip the K/V copy before a sparse prompt batch`: the backend copied the whole K/V cache before every sparse prompt batch, which then only gathers the selected rows.
+- `vulkan: skip the K/V copy before a sparse prompt batch`: the backend copied the whole K/V cache before every sparse prompt batch, which then only gathers the selected rows. This one turned out to be slower and is reverted in the third round.
+
+The third round (report section 10):
+
+- `vulkan: keep the K/V copy for sparse prompt batches`: the revert. Gathering from the per-head copy beats gathering from the interleaved cache.
+- `vulkan: build the sparse attention lists from the top-k picks`: the selected positions go straight to attention as index lists, so the 1.1 GB-per-layer dense mask (at 128K) is no longer written or read.
+- `vulkan: fuse the gated hc_post with the next RMS_NORM + MUL`
+- `vulkan: sum the indexer heads in registers when their weights are equal`
+
+Switches: `GGML_VK_DISABLE_FA_TOPK_INDEX=1`, `GGML_VK_DISABLE_HC_POST_NORM=1`.
 
 ## Running it
 

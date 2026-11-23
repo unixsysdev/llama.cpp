@@ -9,7 +9,7 @@
 #
 # Measured on this box (Vulkan/RADV, thinking on, T=1.0):
 #   decode: ~27 tok/s plain, ~35 with MTP (xhigh effort), ~43 at low effort, ~100 when re-emitting code (n-gram)
-#   prompt: ~700 tok/s on short prompts, ~620 at 32K and ~570 at 128K deep; a 250K-token prompt takes ~8 min
+#   prompt: ~810 tok/s on short prompts, ~660 at 128K deep (4096-token batches)
 #   follow-up turns reuse the prompt cache: +2K tokens at 250K depth took 5 s
 #
 # Usage:

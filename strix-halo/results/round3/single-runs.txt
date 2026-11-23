@@ -1,0 +1,11 @@
+# single runs, Radeon 8060S; the two first empty-cache runs were taken at load 8-9 and are not reported
+round3 pp4096 d=0      695.007511 tok/s load=8.72
+round3 decode n=64     28.746360 tok/s
+round1 decode n=64     28.258216 tok/s
+round3 ppl: Final estimate: PPL = 1.2321 +/- 0.00993
+round3 pp4096 d=131072 661.854757 tok/s load=3.14
+round3 pp4096 d=0 (quiet) 746.479767 tok/s load=9.42
+round3 ppl, mask bypass + hc_post fusion off: Final estimate: PPL = 1.2300 +/- 0.00988
+round3 pp4096 d=0 (rerun) 808.599566 tok/s load=2.43
+round3 ppl, hc_post fusion off only: Final estimate: PPL = 1.2343 +/- 0.01005
+round3 ppl, all on, repeat: Final estimate: PPL = 1.2321 +/- 0.00993
