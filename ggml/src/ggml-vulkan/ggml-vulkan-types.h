@@ -595,6 +595,17 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
     { 3, 2, 2 }, // hc_post->src[2] == scale (post)
 };
 
+// the gated hc_post followed by the next hc mix's RMS_NORM + MUL (qwen4exp)
+static constexpr std::initializer_list<ggml_op> hc_post_norm_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL };
+
+static constexpr std::initializer_list<std::array<int, 3>> hc_post_norm_edges {
+    { 1, 0, 0 }, // sigmoid->src[0]  == scale
+    { 2, 0, 1 }, // scale->src[0]    == sigmoid
+    { 3, 2, 2 }, // hc_post->src[2]  == scale (post)
+    { 4, 0, 3 }, // rms_norm->src[0] == hc_post
+    { 5, 0, 4 }, // mul->src[0]      == rms_norm
+};
+
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
     { 1, 0, 0 }, // reshape->src[0]  == softmax
     { 2, 0, 0 }, // argsort->src[0]  == softmax
@@ -992,6 +1003,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_dsv4_hc_post_norm_f32;
     vk_pipeline pipeline_top_k_mask_f16;
     vk_pipeline pipeline_top_k_mask_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -1368,6 +1380,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_hc_post_norm {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

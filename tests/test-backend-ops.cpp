@@ -4919,15 +4919,19 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         return "DSV4_HC_POST";
     }
 
+    const bool    normed;
+
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, normed);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
+    // normed: the next hc mix's rms_norm * weight follows, as in qwen4exp; the result also adds hc_post
+    // back so both values a fused kernel writes are checked
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, bool normed = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), normed(normed) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4950,6 +4954,12 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         }
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        if (normed) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+            ggml_set_name(w, "w_norm");
+            ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, out, 1e-6f), w);
+            out = ggml_add(ctx, xn, ggml_scale(ctx, out, 0.5f));
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -10919,6 +10929,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
+    // qwen4exp: gated identity hc_post followed by the next mix's rms_norm * w (fused on Vulkan)
+    for (auto [n_embd, n_tokens] : std::vector<std::pair<int64_t, int64_t>>{{31, 17}, {2560, 1}, {2560, 21}, {2560, 257}, {4096, 9}, {4100, 5}}) {
+        test_cases.emplace_back(new test_dsv4_hc_post(n_embd, n_tokens, true, true, true));
+    }
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

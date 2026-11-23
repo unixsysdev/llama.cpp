@@ -1,0 +1,101 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// HC_POST with identity mixing and gated weights, fused with the RMS_NORM + MUL that the next
+// hyper-connection mix applies to its result:
+//
+//   post[s, t]   = gate_scale_out*sigmoid(gate_scale_in*p[s, t])
+//   res[i0, s, t] = x[i0, t]*post[s, t] + residual[i0, s, t]                       -> dst
+//   out[i0, s, t] = res[i0, s, t] / sqrt(mean_i0(res[i0, s, t]^2) + eps) * w[i0, s]  -> dst_norm
+//
+// One workgroup per token keeps the token's res values in registers, so the norm does not read
+// dst back from memory.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_embd;
+    uint n_tokens;
+
+    uint nbx1;               // x: token stride (elements; rows are contiguous)
+    uint nbr1; uint nbr2;    // residual: stream, token
+    uint nbp0; uint nbp1;    // p: stream, token
+    uint nbw1;               // norm weight: stream
+    uint nbd1; uint nbd2;    // dst: stream, token
+    uint nbn1; uint nbn2;    // dst_norm: stream, token
+
+    uint x_offset;
+    uint r_offset;
+    uint p_offset;
+    uint w_offset;
+    uint d_offset;
+    uint n_offset;
+
+    float gate_scale_in;
+    float gate_scale_out;
+    float eps;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer R { float data_r[]; };
+layout(binding = 2, std430) readonly buffer P { float data_p[]; };
+layout(binding = 3, std430) readonly buffer W { float data_w[]; };
+layout(binding = 4, std430) writeonly buffer D { float data_d[]; };
+layout(binding = 5, std430) writeonly buffer N { float data_n[]; };
+
+const uint hc = 4;
+// rows of up to BLOCK_SIZE*MAX_PER elements (checked on the host)
+const uint MAX_PER = 16;
+
+shared float post_s[hc];
+shared vec4 sumsq_s[BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint it  = gl_WorkGroupID.x;
+
+    if (tid < hc) {
+        const float p = data_p[p_offset + tid * nbp0 + it * nbp1];
+        post_s[tid] = gate_scale_out / (1.0f + exp(-(p * gate_scale_in)));
+    }
+    barrier();
+
+    vec4 res[MAX_PER];
+    vec4 sumsq = vec4(0.0f);
+
+    [[unroll]] for (uint j = 0; j < MAX_PER; ++j) {
+        const uint i0 = tid + j * BLOCK_SIZE;
+        if (i0 < n_embd) {
+            const float xv = data_x[x_offset + i0 + it * nbx1];
+            [[unroll]] for (uint s = 0; s < hc; ++s) {
+                const float v = xv * post_s[s] + data_r[r_offset + i0 + s * nbr1 + it * nbr2];
+                data_d[d_offset + i0 + s * nbd1 + it * nbd2] = v;
+                res[j][s] = v;
+            }
+            sumsq += res[j] * res[j];
+        }
+    }
+
+    sumsq_s[tid] = sumsq;
+    barrier();
+    [[unroll]] for (uint off = BLOCK_SIZE / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            sumsq_s[tid] += sumsq_s[tid + off];
+        }
+        barrier();
+    }
+    const vec4 scale = inversesqrt(sumsq_s[0] / float(n_embd) + eps);
+
+    [[unroll]] for (uint j = 0; j < MAX_PER; ++j) {
+        const uint i0 = tid + j * BLOCK_SIZE;
+        if (i0 < n_embd) {
+            [[unroll]] for (uint s = 0; s < hc; ++s) {
+                data_n[n_offset + i0 + s * nbn1 + it * nbn2] = res[j][s] * scale[s] * data_w[w_offset + i0 + s * nbw1];
+            }
+        }
+    }
+}

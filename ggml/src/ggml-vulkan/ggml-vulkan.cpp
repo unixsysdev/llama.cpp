@@ -4089,6 +4089,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_f32,  "dsv4_hc_post_norm_f32",  dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { 256 }, 1);
 
     const uint32_t top_k_mask_wg = std::min({256u, device->properties.limits.maxComputeWorkGroupInvocations, device->properties.limits.maxComputeWorkGroupSize[0]});
     ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {top_k_mask_wg}, 1);
@@ -8175,6 +8176,47 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     init_pushconst_tensor_offsets(ctx, pc, x, residual, p_src, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+// gated identity-mix hc_post plus the RMS_NORM + MUL of the next hc mix, one workgroup per token
+void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * scale_in,
+                               const ggml_tensor * scale_out, ggml_tensor * hc_post, const ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * x = hc_post->src[0];
+    const ggml_tensor * r = hc_post->src[1];
+    const ggml_tensor * p = scale_in->src[0];
+    const ggml_tensor * w = mul->src[1];
+    VK_LOG_DEBUG("ggml_vk_dsv4_hc_post_norm(" << x << ", " << r << ", " << p << ", " << w << ", " << hc_post << ", " << mul << ")");
+
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_norm_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t n_embd   = (uint32_t)x->ne[0];
+    const uint32_t n_tokens = (uint32_t)x->ne[1];
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    vk_op_dsv4_hc_post_norm_push_constants pc = {
+        n_embd, n_tokens,
+        ggml_vk_nb_elem(x, 1),
+        ggml_vk_nb_elem(r, 1), ggml_vk_nb_elem(r, 2),
+        ggml_vk_nb_elem(p, 0), ggml_vk_nb_elem(p, 1),
+        ggml_vk_nb_elem(w, 1),
+        ggml_vk_nb_elem(hc_post, 1), ggml_vk_nb_elem(hc_post, 2),
+        ggml_vk_nb_elem(mul, 1), ggml_vk_nb_elem(mul, 2),
+        get_misalign_bytes(ctx, x) / 4, get_misalign_bytes(ctx, r) / 4, get_misalign_bytes(ctx, p) / 4,
+        get_misalign_bytes(ctx, w) / 4, get_misalign_bytes(ctx, hc_post) / 4, get_misalign_bytes(ctx, mul) / 4,
+        ggml_get_op_params_f32(scale_in, 0),
+        ggml_get_op_params_f32(scale_out, 0),
+        eps,
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, r, true), ggml_vk_tensor_subbuffer(ctx, p, true),
+          ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, hc_post, true), ggml_vk_tensor_subbuffer(ctx, mul, true) },
+        pc, { n_tokens, 1, 1 });
 }
 
 void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -13645,7 +13687,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SCALE:
-        if (ctx->fused_hc_post_gate) {
+        if (ctx->fused_hc_post_norm) {
+            ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, node, cgraph->nodes[node_idx + 2], cgraph->nodes[node_idx + 3],
+                                      cgraph->nodes[node_idx + 4], cgraph->nodes[node_idx + 5]);
+        } else if (ctx->fused_hc_post_gate) {
             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
         } else {
@@ -14796,6 +14841,30 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// hc_post_norm_pattern: identity mixing, f32 rows contiguous along n_embd, a [n_embd, 4] norm weight and rows
+// short enough for dsv4_hc_post_norm.comp (256 invocations x 16 elements)
+static bool ggml_vk_can_fuse_hc_post_norm(const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool disable = getenv("GGML_VK_DISABLE_HC_POST_NORM") != nullptr;
+    if (disable || !ggml_vk_can_fuse_hc_post_gate(cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * hc_post  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * x = hc_post->src[0];
+    const ggml_tensor * r = hc_post->src[1];
+    const ggml_tensor * w = mul->src[1];
+    const int64_t n_embd = hc_post->ne[0];
+
+    return hc_post->src[3] == nullptr && hc_post->ne[1] == 4 && hc_post->ne[3] == 1 && n_embd <= 256 * 16 &&
+           hc_post->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && r->type == GGML_TYPE_F32 &&
+           rms_norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+           x->nb[0] == sizeof(float) && r->nb[0] == sizeof(float) && hc_post->nb[0] == sizeof(float) &&
+           mul->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) &&
+           ggml_are_same_shape(mul, hc_post) && x->ne[0] == n_embd && x->ne[1] == hc_post->ne[2] &&
+           w->ne[0] == n_embd && w->ne[1] == 4 && w->ne[2] == 1 && w->ne[3] == 1;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -15662,6 +15731,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_hc_post_norm = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -15718,6 +15788,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_can_fuse_subgraph(cgraph, i, hc_post_norm_pattern, { i + 3, i + 5 }) &&
+                       ggml_check_edges(cgraph, i, hc_post_norm_edges) &&
+                       ggml_vk_can_fuse_hc_post_norm(cgraph, i)) {
+                ctx->num_additional_fused_ops = hc_post_norm_pattern.size() - 1;
+                ctx->fused_hc_post_norm = true;
+                ctx->fused_ops_write_mask |= 1 << 3; // hc_post is the second output
+                fusion_string = "HC_POST_NORM";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, hc_post_gate_pattern, { i + 3 }) &&
                        ggml_check_edges(cgraph, i, hc_post_gate_edges) &&
                        ggml_vk_can_fuse_hc_post_gate(cgraph, i)) {
@@ -15904,6 +15982,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_hc_post_norm = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -16170,6 +16249,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        if (match_pattern(hc_post_norm_pattern, first_unused)) {
+            add_pattern_alloc_deps(hc_post_norm_pattern, first_unused + (int) hc_post_norm_pattern.size() - 1);
+            keep_pattern(hc_post_norm_pattern);
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -16215,7 +16299,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j) ||
+                match_pattern(hc_post_norm_pattern, j)) {
                 continue;
             }
             bool ok = true;

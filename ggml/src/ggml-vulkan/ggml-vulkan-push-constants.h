@@ -253,6 +253,30 @@ struct vk_op_dsv4_hc_post_push_constants {
     float    gate_scale_out;
 };
 
+// gated identity-mix HC_POST fused with the RMS_NORM + MUL of the next hc mix (dsv4_hc_post_norm.comp)
+struct vk_op_dsv4_hc_post_norm_push_constants {
+    uint32_t n_embd;
+    uint32_t n_tokens;
+
+    uint32_t nbx1;
+    uint32_t nbr1; uint32_t nbr2;
+    uint32_t nbp0; uint32_t nbp1;
+    uint32_t nbw1;
+    uint32_t nbd1; uint32_t nbd2;
+    uint32_t nbn1; uint32_t nbn2;
+
+    uint32_t x_offset;
+    uint32_t r_offset;
+    uint32_t p_offset;
+    uint32_t w_offset;
+    uint32_t d_offset;
+    uint32_t n_offset;
+
+    float    gate_scale_in;
+    float    gate_scale_out;
+    float    eps;
+};
+
 struct vk_op_top_k_mask_push_constants {
     uint32_t n_kv;
     uint32_t n_top;
