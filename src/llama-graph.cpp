@@ -2524,6 +2524,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // The down projection is linear, so the router weights can scale its input instead of its output: in a prompt
+    // batch that input is n_embd/n_ff times smaller. Nothing between the activation and the weighting may be
+    // nonlinear or per-expert (bias, post-expert norm, amax rescale), and the MoE cache path keeps its own layout.
+    // Decode keeps the weighting after the projection, where backends fuse it into the matrix-vector kernel.
+    const bool weight_before_down = !weight_before_ffn && arch == LLM_ARCH_QWEN4EXP && n_tokens > 8 &&
+                                    moe_cache == nullptr && !down_exps_b && !post_exp_norm;
+
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
@@ -2663,6 +2670,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
+        if (weight_before_down) {
+            cur = ggml_mul(ctx0, cur, weights); // [n_ff, n_expert_used, n_tokens] * [1, n_expert_used, n_tokens]
+            cb(cur, "ffn_moe_weighted", il);
+        }
+
         ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
@@ -2693,7 +2705,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !weight_before_down) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
