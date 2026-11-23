@@ -412,7 +412,16 @@ llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (!w_down_inject && w_inject) {
-        inject = ggml_scale(ctx0, build_lora_mm(w_inject, xn), 1.0f / (float) hc);
+        const bool plain_w = (loras == nullptr || loras->empty()) && model.get_w_scale(w_inject) == nullptr &&
+                             build_hadamard_input(w_inject, xn) == xn;
+        if (nt > 8 && w_inject->type == GGML_TYPE_F32 && w_inject->ne[1] <= 8 && plain_w) {
+            // only hc outputs per token: as a matmul that is one tile row and few workgroups; with the operands
+            // swapped it is a matrix-vector product that streams xn once ([nt, hc], then transposed)
+            inject = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, xn, w_inject)));
+        } else {
+            inject = build_lora_mm(w_inject, xn);
+        }
+        inject = ggml_scale(ctx0, inject, 1.0f / (float) hc);
         cb(inject, "hc_inject", il);
     }
 
