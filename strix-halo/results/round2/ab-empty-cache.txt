@@ -1,0 +1,5 @@
+4096-token prompt batch, empty cache, llama-bench -r 2, runs in this order (idle machine, load < 6):
+first-round  tok/s=728.363295 sd=5.801463  load=3.03
+second-round tok/s=814.131684 sd=0.763044  load=3.10
+first-round  tok/s=733.263467 sd=6.365882  load=3.00
+second-round tok/s=807.096453 sd=11.565008  load=2.33

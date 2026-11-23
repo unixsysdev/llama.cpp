@@ -6,7 +6,7 @@
 
 ## Abstract
 
-Qwen3.8-Flash-Next is a 125B mixture-of-experts model with about 6B active parameters per token, a 51B n-gram embedding table, hybrid Gated-DeltaNet / sparse-attention layers and a 256K native context. It fits on a 128 GB AMD Ryzen AI Max+ 395 ("Strix Halo") in a 4-bit quant. Prompt processing with llama.cpp's Vulkan backend, however, falls off a cliff as the context grows: about 700 tokens/s with an empty cache, under 300 tokens/s at 250K. The reason turned out to be simple. The model's sparse attention lets each query look at no more than 2,051 positions, but during prompt processing the Vulkan backend ran it as ordinary dense attention over the whole cache, with a mask. The indexer that picks those 2,051 positions ran on a scalar kernel. I changed two things: prompt batches now use the sparse attention path the backend already had for decoding, and the indexer got a cooperative-matrix kernel. At 128K context prompt processing goes from 301 to 571 tokens/s (+90%), and a 250K-token prompt now takes 7.9 minutes instead of 11.2. Outputs don't change: the backend tests pass and perplexity is the same within noise. The rest of the report covers the settings that mattered on this machine (memory limits, load mode, batch size, backend, speculative decoding). With MTP drafting the model decodes at about 35 tokens/s at maximum reasoning effort, and with n-gram drafting on top it reaches around 100 tokens/s when it re-emits code it has already seen.
+Qwen3.8-Flash-Next is a 125B mixture-of-experts model with about 6B active parameters per token, a 51B n-gram embedding table, hybrid Gated-DeltaNet / sparse-attention layers and a 256K native context. It fits on a 128 GB AMD Ryzen AI Max+ 395 ("Strix Halo") in a 4-bit quant. Prompt processing with llama.cpp's Vulkan backend, however, falls off a cliff as the context grows: about 700 tokens/s with an empty cache, under 300 tokens/s at 250K. The reason turned out to be simple. The model's sparse attention lets each query look at no more than 2,051 positions, but during prompt processing the Vulkan backend ran it as ordinary dense attention over the whole cache, with a mask. The indexer that picks those 2,051 positions ran on a scalar kernel. I changed two things: prompt batches now use the sparse attention path the backend already had for decoding, and the indexer got a cooperative-matrix kernel. At 128K context prompt processing goes from 301 to 571 tokens/s (+90%), and a 250K-token prompt now takes 7.9 minutes instead of 11.2. Outputs don't change: the backend tests pass and perplexity is the same within noise. The rest of the report covers the settings that mattered on this machine (memory limits, load mode, batch size, backend, speculative decoding). With MTP drafting the model decodes at about 35 tokens/s at maximum reasoning effort, and with n-gram drafting on top it reaches around 100 tokens/s when it re-emits code it has already seen. A second pass (section 9), prompted by a review of the first version, adds an int8 kernel for the IQ3_XXS experts and trims the hyper-connection and MoE plumbing: prompt processing goes up another 11-12%, to about 810 tokens/s with an empty cache and 641 at 128K.
 
 ## 1. Setup
 
@@ -142,7 +142,51 @@ This is one machine, and most points are single runs. Repeats agreed within abou
 
 The sparse path still builds a dense `[n_kv x n_tokens]` mask (TOP_K_MASK) and compacts it again, in every QSA layer. Passing the selected indices straight to attention, as upstream #32299 does for CUDA, would remove both steps. The indexer also writes f32 scores that `TOP_K` then reads back, and fusing the two would save that round trip.
 
-Short prompts are no faster than before: still about 700 tokens/s. That is down to the expert matmuls (10-16 TFLOPS with only 80 rows per expert) and the memory-bound hyper-connection ops. My first guess was the `MUL_MAT_ID` tile size, since the backend picks its largest tile (128 rows) for experts that only get about 80. Forcing the medium tile gave 701 tokens/s against 699 for the large one, and the small tile was slower (627), so that isn't it. Fusing the hyper-connection element-wise ops is the next thing I'd try.
+After the first round, short prompts were no faster than before: still about 700 tokens/s. That is down to the expert matmuls and the memory-bound hyper-connection ops. Section 9 gets them to about 810. An earlier version of this paragraph said the `MUL_MAT_ID` tile size made no difference. That experiment was wrong, see section 9.
+
+## 9. A second pass
+
+After the first version went up, someone read through the two commits and the 128K profile and sent a list of suggestions. They ranged from five-line fixes to new kernels. I checked every item against the code and benchmarked the model's own matmul shapes before changing anything. Most of the claims were right. The profile also showed a cost the list had missed. Five changes made the full model faster:
+
+| change | op | GPU time per 4096-token batch |
+|---|---|---:|
+| int8 cooperative-matrix matmul for `IQ3_XXS`, the gate/up experts of 28 layers | `MUL_MAT_ID iq3_xxs` | 694 → 481 ms |
+| the hyper-connection "inject" matmul (4 outputs per token, 96 per batch) as a matrix-vector product | `MUL_MAT f32 m=4` | 192 → 84 ms |
+| MoE router weights applied to the down projection's input, 4x smaller than its output | `MUL` | 244 → 143 ms |
+| radix top-k stops as soon as the boundary bucket is decided | `TOP_K` | 24-33% less (kernel) |
+| no copy of the whole K/V cache before a sparse prompt batch | `FLASH_ATTN_EXT` | ~2.7 ms per QSA layer at 128K |
+
+The first three apply at every context length, the last two only to long ones. The inject matmul is the one the list missed. As a matmul it gets one row of tiles and about 30 workgroups for 40 CUs. With the operands swapped it is a matrix-vector product that reads its input once.
+
+Same day, idle machine, the first-round build and this one alternating:
+
+| | first round | second round |
+|---|---:|---:|
+| empty cache | 731 tok/s | 811 tok/s (+11%) |
+| 128K already cached | 574 tok/s | 641 tok/s (+12%) |
+
+The empty-cache numbers are two pairs of runs (728/733 against 814/807), the 128K ones a single pair. Over the evening the first-round build measured between 726 and 746 tok/s on an empty cache, a little above section 5's 697 from the day before. So read the gain as 8-12%, not exactly 11. Perplexity on the same 32K-token code sample as section 5 is 1.2294 ± 0.0099 (1.2287 before). The new `IQ3_XXS` kernel passes the `MUL_MAT` and `MUL_MAT_ID` backend tests, the top-k change all 534 `TOP_K` tests, and the attention change the sparse tests, plus three new ones on the interleaved K/V layout the model uses.
+
+Some suggestions did not hold up:
+
+- **Top-k early exit.** The list expected the exit to fire on almost every row after the second pass. It fires when the bucket holding the k-th value has exactly as many entries as are still needed. On real scores that saves about one pass of four. That is still worth having.
+- **Large expert tiles.** The first version of this report was wrong here. On AMD the backend never builds the large tile for `MUL_MAT_ID`, so my "large vs medium" run compared the medium tile with itself. Done properly, the large tile is 5-20% faster in the kernel benchmark, where tokens spread evenly over the experts. On the full model it made no difference, so it stays off.
+- **Split-K for the matmuls with few output rows** (4 or 320 rows, K = 10240). Forced splits of 2, 4 or 8 helped one shape and hurt the others, so there's no rule to add.
+- **f16 activations for `MUL_MAT_ID`.** These only matter for types without an int8 path. After the `IQ3_XXS` kernel that leaves `IQ2_S`, used in 3 layers here.
+
+Where an empty-cache batch spends its time now (GPU time, ms):
+
+| | first round | second round |
+|---|---:|---:|
+| expert matmuls | 1686 | 1364 |
+| hyper-connections (`hc_down`/`hc_up` matmuls, inject, `HC_PRE`, `HC_POST`, norms) | 1165 | 1045 |
+| attention and shared-expert projections (`q6_K`) | 921 | 913 |
+| Gated DeltaNet layers | 594 | 560 |
+| MoE weighting, sum and GLU | 431 | 323 |
+| attention | 165 | 164 |
+| everything else | 490 | 476 |
+
+The hyper-connections are next. Fusing the `hc_up` matmul with `DSV4_HC_PRE`, and `HC_POST` with the following `RMS_NORM_MUL`, would save writing and reading the 168 MB residual twice per half-layer. That is 96 times per batch. For long contexts, the biggest open item is still passing the selected indices straight to attention, with no dense mask and no compaction. After that: summing the indexer's four heads in registers, and letting neighbouring tokens share one gather of their mostly overlapping selections.
 
 ## Reproducing
 
@@ -156,3 +200,5 @@ The [README](../README.md) has the build, download and launch steps. The numbers
 | `lb.sh` | Section 6 |
 | `kernels.py` | the kernel tables |
 | `profile.py` | the profiles |
+| `profile_shapes.py` | section 9's per-shape profiles (`results/round2/`) |
+| `ab.sh` | section 9's alternating build comparison |

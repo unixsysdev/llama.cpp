@@ -16,6 +16,8 @@ The model uses sparse attention: each query attends to at most 2,051 positions c
 | decode, no drafting | 26.6 tok/s | 26.3 tok/s |
 | decode, MTP drafting (effort xhigh) | 34.7 tok/s | 34.5 tok/s |
 
+A second pass ([report section 9](strix-halo/REPORT.md#9-a-second-pass)) adds 11-12% on top, measured against the first round on the same day: 731 → 811 tok/s with an empty cache, 574 → 641 tok/s at 128K.
+
 Outputs are the same: all 5,693 flash-attention and 210 indexer backend tests pass, and perplexity matches within noise. Decode speed doesn't change. On upstream I also measured 43 tok/s at `low` reasoning effort, and about 100 tok/s when the model rewrites a file it was given (MTP + n-gram drafting).
 
 ![prompt processing vs depth](strix-halo/figures/prefill_vs_depth.png)
@@ -24,13 +26,21 @@ The full story is in the paper, [strix-halo/REPORT.md](strix-halo/REPORT.md).
 
 ## The changes
 
-The code changes are two commits on top of upstream master `8d60873df`.
+The first round is two commits on top of upstream master `8d60873df`.
 
 `vulkan: use sparse flash attention for prompt batches` touches `ggml-vulkan.cpp`. The sparse attention path (compact each row's selected positions, then gather only those K/V rows) was only reachable for batches of up to 8 rows. Now prompt batches with a sparse-mask hint use it too, once the cache is at least 4x the selection (16x for quantized K/V). The kernel is 2x faster at 16K, 3.4x at 32K and 9.2x at 128K.
 
 `vulkan: cooperative matrix lightning indexer` adds `lightning_indexer_cm1.comp`, which computes 64x64 key/token tiles with 16x16x16 f16 MMAs. It's 4.2-4.9x faster than the scalar shader, which is still used for 16 tokens or fewer.
 
 Both can be switched off at runtime: `GGML_VK_FA_SPARSE_PREFILL_DISABLE=1` and `GGML_VK_DISABLE_LIGHTNING_INDEXER_COOPMAT=1`. `GGML_VK_FA_SPARSE_PREFILL_RATIO=<n>` changes the threshold.
+
+The second round (report section 9) is five more:
+
+- `vulkan: int8 coopmat matmul for IQ3_XXS`: the 28 layers whose expert gate/up weights are IQ3_XXS used the f16 matmul. They now use the int8 one, like IQ4_XS, and run as fast.
+- `qwen4exp: compute the hc inject weights as a matrix-vector product`: a matmul with 4 outputs per token, 96 times per batch, was using one row of tiles.
+- `llama-graph: weight the MoE experts before the down projection (qwen4exp)`: the router weights now scale the down projection's input, which is a quarter the size of its output.
+- `vulkan: end the radix top-k once the boundary bucket is decided`
+- `vulkan: skip the K/V copy before a sparse prompt batch`: the backend copied the whole K/V cache before every sparse prompt batch, which then only gathers the selected rows.
 
 ## Running it
 

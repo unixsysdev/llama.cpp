@@ -1,0 +1,46 @@
+depth 0: 4871 ms GPU per 4096-token batch
+   480.5 ms   9.9%    56x  MUL_MAT_ID iq3_xxs m=640 n=10 k=2560 n_expert=512 batch=4096
+   374.1 ms   7.7%    32x  MUL_MAT_ID q5_0 m=2560 n=10 k=640 n_expert=512 batch=4096
+   365.9 ms   7.5%    35x  MUL_MAT q6_K m=10240 n=4096 k=2560
+   261.8 ms   5.4%    32x  MUL_MAT_ID iq4_xs m=640 n=10 k=2560 n_expert=512 batch=4096
+   232.5 ms   4.8%    95x  MUL_MAT q8_0 m=320 n=4096 k=10240
+   227.6 ms   4.7%    95x  MUL_MAT q8_0 m=10240 n=4096 k=320
+   223.0 ms   4.6%    35x  MUL_MAT q6_K m=6144 n=4096 k=2560
+   203.7 ms   4.2%    36x  MUL_MAT q8_0 m=2560 n=4096 k=6144
+   192.9 ms   4.0%    36x  GATED_DELTA_NET
+   175.5 ms   3.6%    96x  DSV4_HC_PRE
+   164.5 ms   3.4%    12x  FLASH_ATTN_EXT dst(256,24,4096,1),  q(256,4096,24,1),  k(256,4096,2,1),  v(256,4096,2,1),  m(4096,4096,1,1)
+   163.5 ms   3.4%    95x  HC_POST_GATE SCALE
+   161.6 ms   3.3%    98x  RMS_NORM_MUL RMS_NORM(2560,4,4096,1)
+   156.2 ms   3.2%    13x  MUL_MAT_ID iq4_nl m=2560 n=10 k=640 n_expert=512 batch=4096
+   150.7 ms   3.1%    12x  MUL_MAT q6_K m=12288 n=4096 k=2560
+   142.8 ms   2.9%   149x  MUL
+   110.4 ms   2.3%    50x  MULTI_ADD ADD
+    96.1 ms   2.0%    49x  CONCAT
+    85.7 ms   1.8%    47x  MUL_MAT f32 m=512 n=4096 k=2560
+    84.3 ms   1.7%    95x  MUL_MAT_VEC f32 m=4096 n=4 k=10240
+    81.6 ms   1.7%    12x  MUL_MAT q6_K m=2560 n=4096 k=6144
+    75.9 ms   1.6%    92x  MUL_MAT q6_K m=640 n=4096 k=2560
+    69.6 ms   1.4%    96x  GLU
+    67.8 ms   1.4%     6x  MUL_MAT_ID iq2_s m=640 n=10 k=2560 n_expert=512 batch=4096
+    67.8 ms   1.4%    36x  SSM_CONV_SILU SSM_CONV
+    43.1 ms   0.9%    72x  MUL_MAT f32 m=48 n=4096 k=2560
+    42.0 ms   0.9%   133x  SIGMOID
+    40.4 ms   0.8%   123x  ADD
+    36.0 ms   0.7%    47x  MUL_MAT q8_0 m=2560 n=4096 k=640
+    31.4 ms   0.6%    36x  RMS_NORM_MUL RMS_NORM(128,48,4096,1)
+    26.3 ms   0.5%   129x  CONT
+    24.1 ms   0.5%    12x  MUL_MAT bf16 m=512 n=4096 k=2560
+    23.3 ms   0.5%     2x  MUL_MAT_ID q2_0 m=2560 n=10 k=640 n_expert=512 batch=4096
+    23.2 ms   0.5%   185x  SCALE
+    22.5 ms   0.5%    72x  RMS_NORM(128,16,4096,1)
+    16.5 ms   0.3%    12x  RMS_NORM_MUL RMS_NORM(256,24,4096,1)
+    16.0 ms   0.3%     2x  MUL_MAT q8_0 m=10240 n=4096 k=2560
+    15.9 ms   0.3%    24x  MUL_MAT q6_K m=512 n=4096 k=2560
+    15.8 ms   0.3%    12x  TOP_K K=512 (1088,4096,1,1)
+    13.4 ms   0.3%    36x  ROPE
+    12.1 ms   0.2%    47x  MUL_MAT f32 m=1 n=4096 k=2560
+    10.0 ms   0.2%    12x  MUL_MAT bf16 m=128 n=4096 k=2560
+     8.3 ms   0.2%    12x  LIGHTNING_INDEXER
+     5.0 ms   0.1%     1x  MUL_MAT q8_0 m=6144 n=4096 k=2560
+     4.4 ms   0.1%    98x  SILU

@@ -1,0 +1,29 @@
+Kernel timings behind section 9 (test-backend-ops perf, Vulkan0 = Radeon 8060S, idle machine)
+
+hc inject, 4 outputs x 4096 tokens, K = 10240 (f32):
+  as a matmul (m=4, n=4096)            1688.7 us
+  as a matrix-vector product (swapped)   778.6 us
+
+Expert gate/up, 128 experts x 10 used x 1024 tokens, 640 x 2560 (MUL_MAT_ID), after the IQ3_XXS change:
+  iq3_xxs (int8 coopmat)   2554.6 us
+  iq4_xs  (int8 coopmat)   2556.3 us
+In the full model (profile-0-*.txt, per call): iq3_xxs 12.4 ms before, 8.6 ms after.
+
+Top-k, k = 2048 (existing perf cases), first-round build vs second-round build:
+  cols=32768  rows=16    21.57 ->  16.43 us
+  cols=32768  rows=32    28.22 ->  19.63 us
+  cols=131072 rows=16    83.25 ->  61.88 us
+  cols=131072 rows=32   103.31 ->  69.73 us
+
+Large MUL_MAT_ID tile (not kept: no change on the full model), medium -> large:
+  iq3_xxs m=640  k=2560   2453.5 -> 2318.2 us
+  iq4_xs  m=640  k=2560   2551.6 -> 2239.3 us
+  iq2_s   m=640  k=2560   3579.8 -> 2829.1 us
+  q5_0    m=2560 k=640    2712.2 -> 2523.7 us
+  iq4_nl  m=2560 k=640    2784.2 -> 2580.3 us
+
+Forced split-K (not kept), split 1 / 2 / 4 / 8, us:
+  f32  m=4   k=10240   1710.8 / 1826.1 / 1913.8 / 1169.1
+  f32  m=324 k=10240   3927.4 / 3604.0 / 3069.3 / 2780.0
+  f32  m=48  k=2560     231.6 /  279.5 /  386.0 /  548.4
+  q8_0 m=320 k=10240   1697.9 / 1604.6 / 1705.1 / 1922.1

@@ -1,0 +1,6 @@
+4096-token prompt batch at 131072 tokens depth, llama-bench -r 1, in this order (idle machine):
+second-round tok/s=640.747980 load=2.19
+first-round  tok/s=573.902271 load=2.28
+
+llama-perplexity, first 32768 tokens of code_1300k.txt, -c 32768 -b 4096 -ub 4096 --chunks 1, second-round build:
+Final estimate: PPL = 1.2294 +/- 0.00985
