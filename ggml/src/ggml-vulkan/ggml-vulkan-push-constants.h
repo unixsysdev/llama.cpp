@@ -1009,6 +1009,22 @@ struct vk_op_flash_attn_sparse_compact_push_constants {
     uint32_t n_kv_max;
 };
 
+// fa_sparse_from_topk.comp: the sparse index lists from the inputs of a TOP_K_MASK
+struct vk_op_fa_sparse_from_topk_push_constants {
+    uint32_t n_kv;
+    uint32_t n_top;
+    uint32_t n_pick;
+    uint32_t n_blk;
+    uint32_t n_extra;
+    uint32_t has_score;
+    uint32_t n_kv_max;
+    uint32_t nem1;
+    uint32_t k_offset;
+    uint32_t s_offset;
+    uint32_t b_offset;
+    uint32_t e_offset;
+};
+
 template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     GGML_UNUSED(p);
     GGML_UNUSED(src0);

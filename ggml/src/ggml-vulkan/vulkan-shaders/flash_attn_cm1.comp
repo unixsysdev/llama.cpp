@@ -245,7 +245,7 @@ void main() {
                             f16vec4 m;
                             if (USE_SPARSE) {
                                 // sparse is gqa-gated (m_stride == 0): all four rows share the value
-                                FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
+                                FLOAT_TYPE mv = SPARSE_ZERO_MASK ? FLOAT_TYPE(0) : FLOAT_TYPE(data_m[m_offset + kcol]);
                                 m = f16vec4(mv);
                                 max_mask = max(max_mask, float(mv));
                             } else if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {

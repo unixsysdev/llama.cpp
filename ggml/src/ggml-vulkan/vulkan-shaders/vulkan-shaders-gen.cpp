@@ -963,6 +963,7 @@ void process_shaders() {
 #endif
 
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
+    string_to_spv("fa_sparse_from_topk", "fa_sparse_from_topk.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});

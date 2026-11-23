@@ -10001,6 +10001,130 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// TOP_K_MASK feeding FLASH_ATTN_EXT through a reshape, as qwen4exp builds QSA. A backend may build the sparse index
+// lists from the TOP_K_MASK inputs instead of the dense mask, and skip the TOP_K_MASK when nothing else reads it.
+struct test_fa_topk_mask : public test_case {
+    const int64_t hs;
+    const int64_t nh;          // K/V heads
+    const int64_t gqa;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t n_blk;
+    const int64_t n_top;
+    const int64_t n_extra;
+    const bool    messy;       // repeated picks, out-of-range and shared cells
+    const bool    interleaved; // K/V heads interleaved per cell, as in a KV cache
+    const bool    mask_reader; // another op reads the TOP_K_MASK output too
+
+    std::string vars() override {
+        return VARS_TO_STR11(hs, nh, gqa, kv, nb, n_blk, n_top, n_extra, messy, interleaved, mask_reader);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FA_TOPK_MASK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_fa_topk_mask(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 12, int64_t kv = 8192, int64_t nb = 64,
+            int64_t n_blk = 4, int64_t n_top = 128, int64_t n_extra = 3, bool messy = false, bool interleaved = false,
+            bool mask_reader = false)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_blk(n_blk), n_top(n_top), n_extra(n_extra), messy(messy),
+          interleaved(interleaved), mask_reader(mask_reader) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_pick = kv / n_blk;
+
+        ggml_tensor * keep = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, kv), 0.0f);
+
+        ggml_tensor * top_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top, nb);
+        ggml_set_name(top_k, "top_k");
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pick, nb);
+        ggml_set_name(score, "score");
+        ggml_tensor * blocks = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blk, n_pick);
+        ggml_set_name(blocks, "blocks");
+        ggml_tensor * extra = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_extra, nb);
+        ggml_set_name(extra, "extra");
+
+        ggml_tensor * sel = ggml_top_k_mask(ctx, keep, top_k, score, blocks, extra);
+        ggml_tensor * m   = ggml_reshape_4d(ctx, sel, kv, nb, 1, 1);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        if (interleaved) {
+            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, nh, kv, 1), 0, 2, 1, 3);
+            v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, nh, kv, 1), 0, 2, 1, 3);
+        } else {
+            k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+            v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(out, n_top*n_blk + n_extra);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+
+        if (mask_reader) {
+            ggml_tensor * aux = ggml_sum_rows(ctx, ggml_clamp(ctx, ggml_cast(ctx, sel, GGML_TYPE_F32), -1.0f, 1.0f));
+            out = ggml_add(ctx, out, ggml_reshape_4d(ctx, aux, 1, 1, nb, 1));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x51A);
+        const int64_t n_pick = kv / n_blk;
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<int32_t> idata;
+            if (strcmp(t->name, "top_k") == 0) {
+                idata.resize(ggml_nelements(t));
+                std::vector<int32_t> perm(n_pick);
+                for (int64_t r = 0; r < nb; ++r) {
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), gen);
+                    for (int64_t i = 0; i < n_top; ++i) {
+                        // messy: repeats and out-of-range picks
+                        idata[r*n_top + i] = messy ? (int32_t) (gen() % (n_pick + 2)) - 1 : perm[i];
+                    }
+                }
+            } else if (strcmp(t->name, "blocks") == 0) {
+                idata.resize(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) idata.size(); ++i) {
+                    // block p holds cells p*n_blk.., the last block of a real cache can be padded with n_kv
+                    idata[i] = messy ? (int32_t) (gen() % (kv + 2)) - 1 : (i >= (n_pick - 1)*n_blk + 2 ? (int32_t) kv : (int32_t) i);
+                }
+            } else if (strcmp(t->name, "extra") == 0) {
+                idata.resize(ggml_nelements(t));
+                for (int64_t r = 0; r < nb; ++r) {
+                    for (int64_t i = 0; i < n_extra; ++i) {
+                        idata[r*n_extra + i] = messy ? (int32_t) (gen() % (kv + 2)) - 1 : (i == n_extra - 1 ? (int32_t) kv : (int32_t) (kv - 1 - r % 7 - i));
+                    }
+                }
+            } else if (strcmp(t->name, "score") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+                for (auto & v : data) {
+                    v = gen() % 8 == 0 ? -INFINITY : dis(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                continue;
+            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+                init_tensor_uniform(t);
+                continue;
+            } else {
+                continue;
+            }
+            ggml_backend_tensor_set(t, idata.data(), 0, idata.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -10933,6 +11057,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
+    // QSA: TOP_K_MASK into sparse flash attention (prefill rows, decode, short cache, extra mask reader)
+    for (bool interleaved : {false, true}) {
+        for (bool messy : {false, true}) {
+            for (int64_t nb : {1, 3, 64}) {
+                test_cases.emplace_back(new test_fa_topk_mask(128, 2, 12, 8192, nb, 4, 128, 3, messy, interleaved));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_fa_topk_mask(128, 2, 12, 1024, 64, 4, 64, 3));
+    test_cases.emplace_back(new test_fa_topk_mask(128, 2, 12, 8192, 64, 4, 128, 3, false, false, true));
+    test_cases.emplace_back(new test_fa_topk_mask(256, 2, 12, 16384, 33, 4, 512, 3, false, true));
     // qwen4exp: gated identity hc_post followed by the next mix's rms_norm * w (fused on Vulkan)
     for (auto [n_embd, n_tokens] : std::vector<std::pair<int64_t, int64_t>>{{31, 17}, {2560, 1}, {2560, 21}, {2560, 257}, {4096, 9}, {4100, 5}}) {
         test_cases.emplace_back(new test_dsv4_hc_post(n_embd, n_tokens, true, true, true));

@@ -1052,6 +1052,8 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
     vk_pipeline pipeline_fa_sparse_compact;
+    vk_pipeline pipeline_fa_sparse_from_topk;
+    uint32_t fa_topk_index_max_kv {};
     vk_pipeline pipeline_fa_sparse_compact_subgroup;
     bool fa_sparse_compact_use_subgroups;
 
@@ -1381,6 +1383,9 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_hc_post_norm {};
+    // sparse flash attention fed by a TOP_K_MASK's inputs (see ggml_vk_plan_fa_topk_index)
+    std::vector<const ggml_tensor *> fa_topk_index_nodes;
+    std::vector<const ggml_tensor *> topk_mask_skip;
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

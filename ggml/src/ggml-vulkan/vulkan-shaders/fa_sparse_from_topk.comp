@@ -1,0 +1,116 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// The sparse flash attention index lists, built from the inputs of a TOP_K_MASK instead of compacting the dense
+// mask it writes. One workgroup per mask row marks the kept cells in a shared bitmap (the valid cells of the live
+// picks, and the valid extra cells), then writes them in ascending order, -1 padded to n_kv_max.
+// When the mask the TOP_K_MASK copies is finite everywhere, that is exactly the list
+// flash_attn_sparse_compact.comp extracts from its output, in the same order.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint MAX_WORDS  = 8448; // n_kv <= 32 * MAX_WORDS, checked on the host
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_kv;
+    uint n_top;
+    uint n_pick;
+    uint n_blk;     // 0: a pick is a cell
+    uint n_extra;
+    uint has_score;
+    uint n_kv_max;
+    uint nem1;
+    uint k_offset;
+    uint s_offset;
+    uint b_offset;
+    uint e_offset;
+};
+
+layout(binding = 0, std430) readonly buffer K { int data_k[]; };
+layout(binding = 1, std430) readonly buffer S { uint data_s[]; };
+layout(binding = 2, std430) readonly buffer B { int data_b[]; };
+layout(binding = 3, std430) readonly buffer E { int data_e[]; };
+layout(binding = 4, std430) writeonly buffer I { int data_i[]; };
+
+shared uint bits[MAX_WORDS];
+shared uint scan[BLOCK_SIZE];
+
+// score > -inf, as top_k_mask.comp decides it
+bool is_live(const uint s) {
+    return s != 0xFF800000u && (s & 0x7FFFFFFFu) <= 0x7F800000u;
+}
+
+void mark(const int c) {
+    if (c >= 0 && uint(c) < n_kv) {
+        atomicOr(bits[uint(c) >> 5], 1u << (uint(c) & 31u));
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint row = gl_WorkGroupID.x + nem1 * gl_WorkGroupID.y;
+    const uint out_base = row * n_kv_max;
+    const uint n_words = (n_kv + 31) / 32;
+
+    for (uint w = tid; w < n_words; w += BLOCK_SIZE) {
+        bits[w] = 0;
+    }
+    barrier();
+
+    for (uint i = tid; i < n_top; i += BLOCK_SIZE) {
+        const int p = data_k[k_offset + row * n_top + i];
+        if (p < 0 || uint(p) >= n_pick) {
+            continue;
+        }
+        if (has_score != 0 && !is_live(data_s[s_offset + row * n_pick + uint(p)])) {
+            continue;
+        }
+        if (n_blk == 0) {
+            mark(p);
+            continue;
+        }
+        for (uint b = 0; b < n_blk; ++b) {
+            mark(data_b[b_offset + uint(p) * n_blk + b]);
+        }
+    }
+    for (uint i = tid; i < n_extra; i += BLOCK_SIZE) {
+        mark(data_e[e_offset + row * n_extra + i]);
+    }
+    barrier();
+
+    // each invocation owns a contiguous run of words: count, exclusive prefix sum, write in ascending order
+    const uint run   = (n_words + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint begin = min(tid * run, n_words);
+    const uint end   = min(begin + run, n_words);
+    uint count = 0;
+    for (uint w = begin; w < end; ++w) {
+        count += bitCount(bits[w]);
+    }
+
+    scan[tid] = count;
+    barrier();
+    for (uint off = 1; off < BLOCK_SIZE; off <<= 1) {
+        const uint add = tid >= off ? scan[tid - off] : 0;
+        barrier();
+        scan[tid] += add;
+        barrier();
+    }
+    uint pos = scan[tid] - count;
+    const uint total = min(scan[BLOCK_SIZE - 1], n_kv_max);
+
+    for (uint w = begin; w < end && pos < n_kv_max; ++w) {
+        uint word = bits[w];
+        while (word != 0 && pos < n_kv_max) {
+            data_i[out_base + pos] = int(w * 32 + uint(findLSB(word)));
+            pos++;
+            word &= word - 1;
+        }
+    }
+
+    for (uint i = total + tid; i < n_kv_max; i += BLOCK_SIZE) {
+        data_i[out_base + i] = -1;
+    }
+}

@@ -1441,7 +1441,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type,
+                                                  bool sparse_zero_mask) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1452,7 +1453,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_sparse        ? 16 : 0) |
                      (params.q_in_regs  ? 32 : 0) |
                      (params.flip       ? 64 : 0) |
-                     (params.flip_direct ? 128 : 0);
+                     (params.flip_direct ? 128 : 0) |
+                     (sparse_zero_mask  ? 256 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -3657,6 +3659,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } else {
             ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_compact, "fa_sparse_compact", fa_sparse_compact_len, fa_sparse_compact_data, "main", 2, sizeof(vk_op_flash_attn_sparse_compact_push_constants), {1, 1, 1}, {compact_max}, 1, true);
         }
+        // one bit per cache cell in shared memory, next to a 256-entry scan
+        device->fa_topk_index_max_kv = 32u * std::min<uint32_t>(8448u, (device->properties.limits.maxComputeSharedMemorySize - 256u * 4u) / 4u);
+        ggml_vk_create_pipeline(device, device->pipeline_fa_sparse_from_topk, "fa_sparse_from_topk", fa_sparse_from_topk_len, fa_sparse_from_topk_data, "main", 5, sizeof(vk_op_fa_sparse_from_topk_push_constants), {1, 1, 1}, {256u, device->fa_topk_index_max_kv / 32u}, 1);
     }
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
@@ -9064,7 +9069,37 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
-void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+// The TOP_K_MASK behind a flash attention mask when its index lists can be built from the TOP_K_MASK inputs
+// (fa_sparse_from_topk.comp) instead: the mask is a plain reshape of a contiguous f16 TOP_K_MASK whose copied
+// mask is a zero fill, so every kept cell is 0 and every other one -inf.
+static const ggml_tensor * ggml_vk_fa_topk_mask_src(const ggml_backend_vk_context * ctx, const ggml_tensor * mask) {
+    if (mask == nullptr || ctx->device->pipeline_fa_sparse_from_topk == nullptr || mask->ne[0] > ctx->device->fa_topk_index_max_kv) {
+        return nullptr;
+    }
+    const ggml_tensor * m = mask->view_src ? mask->view_src : mask;
+    if (m->op != GGML_OP_TOP_K_MASK || m->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
+        mask->view_offs != 0 || !ggml_is_contiguous(m) || !ggml_is_contiguous(mask) || mask->ne[0] != m->ne[0] ||
+        ggml_nelements(mask) != ggml_nelements(m)) {
+        return nullptr;
+    }
+    const ggml_tensor * keep   = m->src[0];
+    const ggml_tensor * top_k  = m->src[1];
+    const ggml_tensor * score  = m->src[2];
+    const ggml_tensor * blocks = m->src[3];
+    const ggml_tensor * extra  = m->src[4];
+    const int64_t rows = ggml_nrows(m);
+    auto rows_ok = [&](const ggml_tensor * t) {
+        return ggml_is_contiguous(t) && ggml_nrows(t) == rows;
+    };
+    return keep && keep->op == GGML_OP_FILL && ggml_get_op_params_f32(keep, 0) == 0.0f &&
+           ggml_nrows(keep) == 1 && keep->ne[0] == m->ne[0] &&
+           top_k->type == GGML_TYPE_I32 && rows_ok(top_k) &&
+           (!score  || (score->type == GGML_TYPE_F32 && rows_ok(score))) &&
+           (!blocks || (blocks->type == GGML_TYPE_I32 && ggml_is_contiguous(blocks))) &&
+           (!extra  || (extra->type == GGML_TYPE_I32 && rows_ok(extra))) ? m : nullptr;
+}
+
+void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst, bool * plan_use_sparse) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -9235,6 +9270,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                             nem0 == KV &&
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
                             (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
+    if (plan_use_sparse) {
+        // planning pass (ggml_vk_plan_fa_topk_index): nothing above has side effects.
+        // coopmat2 reads the sparse mask its own way, so it keeps the compaction.
+        *plan_use_sparse = use_sparse && tuning_params.path != FA_COOPMAT2;
+        return;
+    }
+    // index lists from the TOP_K_MASK inputs: the mask itself is not read (it may not even be written)
+    const bool topk_index = use_sparse && tuning_params.path != FA_COOPMAT2 &&
+        std::find(ctx->fa_topk_index_nodes.begin(), ctx->fa_topk_index_nodes.end(), dst) != ctx->fa_topk_index_nodes.end();
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     const uint32_t q_stride_eff = gqa_ratio > 1 ? (uint32_t)(nbq2 / ggml_type_size(q->type)) : q_stride;
@@ -9291,7 +9335,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff, topk_index);
 
     vk_pipeline pipeline = nullptr;
 
@@ -9498,7 +9542,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ? ctx->device->pipeline_fa_sparse_compact_subgroup
         : ctx->device->pipeline_fa_sparse_compact;
     if (use_sparse) {
-        ggml_pipeline_request_descriptor_sets(ctx, sparse_compact_pipeline, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, topk_index ? ctx->device->pipeline_fa_sparse_from_topk : sparse_compact_pipeline, 1);
         if (ctx->prealloc_size_y < sparse_idx_size) {
             ctx->prealloc_size_y = sparse_idx_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -9605,7 +9649,37 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    if (use_sparse)
+    if (topk_index) {
+        const ggml_tensor * tkm    = ggml_vk_fa_topk_mask_src(ctx, mask);
+        const ggml_tensor * top_k  = tkm->src[1];
+        const ggml_tensor * score  = tkm->src[2];
+        const ggml_tensor * blocks = tkm->src[3];
+        const ggml_tensor * extra  = tkm->src[4];
+        const uint32_t n_top = (uint32_t)top_k->ne[0];
+        const vk_subbuffer k_sub = ggml_vk_tensor_subbuffer(ctx, top_k, true);
+        const vk_op_fa_sparse_from_topk_push_constants tk_pc = {
+            (uint32_t)tkm->ne[0],
+            n_top,
+            (uint32_t)(blocks ? blocks->ne[1] : score ? score->ne[0] : tkm->ne[0]),
+            blocks ? (uint32_t)blocks->ne[0] : 0u,
+            extra ? (uint32_t)extra->ne[0] : 0u,
+            score ? 1u : 0u,
+            (uint32_t)n_kv_max,
+            nem1,
+            get_misalign_bytes(ctx, top_k) / 4,
+            score  ? get_misalign_bytes(ctx, score)  / 4 : 0u,
+            blocks ? get_misalign_bytes(ctx, blocks) / 4 : 0u,
+            extra  ? get_misalign_bytes(ctx, extra)  / 4 : 0u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_fa_sparse_from_topk,
+                                  { k_sub,
+                                    score  ? ggml_vk_tensor_subbuffer(ctx, score,  true) : k_sub,
+                                    blocks ? ggml_vk_tensor_subbuffer(ctx, blocks, true) : k_sub,
+                                    extra  ? ggml_vk_tensor_subbuffer(ctx, extra,  true) : k_sub,
+                                    sparse_buf }, tk_pc,
+                                  { nem1, nem2 * nem3, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+    } else if (use_sparse)
     {
         const vk_op_flash_attn_sparse_compact_push_constants sc_pc = {
             KV,
@@ -13991,7 +14065,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_TOP_K_MASK:
-        ggml_vk_top_k_mask(ctx, compute_ctx, node);
+        // read only by flash attention that builds its index lists from this op's inputs
+        if (std::find(ctx->topk_mask_skip.begin(), ctx->topk_mask_skip.end(), node) == ctx->topk_mask_skip.end()) {
+            ggml_vk_top_k_mask(ctx, compute_ctx, node);
+        }
 
         break;
 
@@ -15568,6 +15645,58 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// Plan which sparse flash attentions take their index lists from a TOP_K_MASK's inputs, and which TOP_K_MASKs
+// then need not run because flash attention in that mode is the only reader of their output.
+static void ggml_vk_plan_fa_topk_index(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->fa_topk_index_nodes.clear();
+    ctx->topk_mask_skip.clear();
+
+    static const bool disable = getenv("GGML_VK_DISABLE_FA_TOPK_INDEX") != nullptr;
+    if (disable) {
+        return;
+    }
+
+    std::vector<const ggml_tensor *> masks;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT || ggml_vk_fa_topk_mask_src(ctx, node->src[3]) == nullptr) {
+            continue;
+        }
+        bool use_sparse = false;
+        vk_context none;
+        ggml_vk_flash_attn(ctx, none, node->src[0], node->src[1], node->src[2], node->src[3], node->src[4], node, &use_sparse);
+        if (use_sparse) {
+            ctx->fa_topk_index_nodes.push_back(node);
+            masks.push_back(ggml_vk_fa_topk_mask_src(ctx, node->src[3]));
+        }
+    }
+
+    for (const ggml_tensor * m : masks) {
+        if (std::find(ctx->topk_mask_skip.begin(), ctx->topk_mask_skip.end(), m) != ctx->topk_mask_skip.end() ||
+            (m->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        bool only_fa = true;
+        for (int i = 0; i < cgraph->n_nodes && only_fa; ++i) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node == m || ggml_vk_is_empty(node)) {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = node->src[s];
+                if (src && (src == m || src->view_src == m) &&
+                    std::find(ctx->fa_topk_index_nodes.begin(), ctx->fa_topk_index_nodes.end(), node) == ctx->fa_topk_index_nodes.end()) {
+                    only_fa = false;
+                    break;
+                }
+            }
+        }
+        if (only_fa) {
+            ctx->topk_mask_skip.push_back(m);
+        }
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -15597,6 +15726,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Reserve tensor context space for all nodes
     ctx->tensor_ctxs.resize(cgraph->n_nodes);
+
+    ggml_vk_plan_fa_topk_index(ctx, cgraph);
 
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch

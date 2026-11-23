@@ -30,6 +30,9 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+// Sparse with an all-zero mask (the index lists come from a TOP_K_MASK's inputs): listed cells add 0 without
+// reading the mask, padding slots are -inf as usual.
+const bool SPARSE_ZERO_MASK = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
