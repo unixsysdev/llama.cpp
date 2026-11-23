@@ -9120,11 +9120,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                 (k->nb[1] != (uint64_t)HSK * ggml_type_size(k->type) ||
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
-    // the strided copy only speeds up dense reads; a sparse prefill gathers just the selected rows, so copying the
-    // whole cache first would only cost bandwidth (K/V types are unchanged by that copy, so the decision is final)
-    const bool kv_raw_sparse = kv_raw_strided &&
-        use_sparse_prefill(k->type, v->type,
-                           get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k->type, v->type, f32acc, qk_ratio).path);
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
     // K and V share one scratch buffer, so the sum must fit in one allocation
     const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
@@ -9132,7 +9127,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t cm2_min_reuse = KV >= 8192 ? 4096 : 8192;
     // Query reuse must cover the conversion and synchronization cost.
     const bool cm2_dequant_kv = KV >= 4096 && neq1 >= cm2_min_queries && (uint64_t) neq1 * qk_ratio >= cm2_min_reuse;
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && !kv_raw_sparse && neq1 >= 64 &&
+    // the copy also pays off for sparse prompt batches: gathering rows from the per-head layout is faster than
+    // from the interleaved cache by more than the copy costs (QSA at 32K: 670 vs 710-740 ms of FA per batch)
+    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -9153,7 +9150,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     const bool sparse_prefill = use_sparse_prefill(k_type_eff, v_type_eff, tuning_params.path);
-    GGML_ASSERT(!kv_raw_sparse || sparse_prefill);
 
     if ((N <= 8 || sparse_prefill) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
