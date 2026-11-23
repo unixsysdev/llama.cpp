@@ -34,7 +34,7 @@ fa_off = perf("FLASH_ATTN_EXT", fa_pat, {"GGML_VK_FA_SPARSE_PREFILL_DISABLE": "1
 attention = sorted(({"kv": field(k, "kv"), "dense_us": fa_off[k], "sparse_us": v} for k, v in fa_on.items() if k in fa_off),
                    key=lambda r: r["kv"])
 
-li_pat = "nh=4,kv=(4096|65536),nb=(1|512|2048),ns=1,nm=1,type_K=f16"
+li_pat = "nh=4,kv=(4096|65536),nb=(1|512|2048),ns=1,nm=1,type_K=f16,w_const=0"
 li_on = perf("LIGHTNING_INDEXER", li_pat, {})
 li_off = perf("LIGHTNING_INDEXER", li_pat, {"GGML_VK_DISABLE_LIGHTNING_INDEXER_COOPMAT": "1"})
 indexer = sorted(({"kv": field(k, "kv"), "nb": field(k, "nb"), "scalar_us": li_off[k], "coopmat_us": v}

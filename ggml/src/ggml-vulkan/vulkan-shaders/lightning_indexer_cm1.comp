@@ -71,6 +71,7 @@ shared f16vec4 k_sh[BK * KQ_STRIDE];
 shared f16vec4 q_sh[BT * KQ_STRIDE];
 shared float   s_sh[BT * S_STRIDE];
 shared float   w_sh[BT];
+shared uint    w_uniform;
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
@@ -116,6 +117,28 @@ void main() {
         score[j] = 0.0;
     }
 
+    // When every head weight of this token tile is the same (Qwen QSA: 1/sqrt(head_dim) for all), the
+    // weighted sum is w * sum_h relu(qk_h): keep that sum in the accumulators and spill it once at the end,
+    // instead of spilling and re-reading the qk tile for every head.
+    const float w0 = weights[t0 * w_nb1 + s * w_nb3];
+    if (tid == 0) {
+        w_uniform = 1u;
+    }
+    barrier();
+    for (uint i = tid; i < n_heads * BT; i += WG_SIZE) {
+        const uint t = t0 + i % BT;
+        if (t < n_tokens && weights[i / BT + t * w_nb1 + s * w_nb3] != w0) {
+            atomicAnd(w_uniform, 0u);
+        }
+    }
+    barrier();
+    const bool uniform_w = w_uniform != 0u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> relu_sum[BT / 16];
+    [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
+        relu_sum[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
     for (uint h = 0; h < n_heads; ++h) {
         // the previous head is fully consumed and, on the first pass, the key tile is complete
         barrier();
@@ -133,7 +156,7 @@ void main() {
             q_sh[r * KQ_STRIDE + c4] = f16vec4(v);
         }
 
-        if (tid < BT) {
+        if (!uniform_w && tid < BT) {
             const uint t = t0 + tid;
             w_sh[tid] = t < n_tokens ? weights[h + t * w_nb1 + s * w_nb3] : 0.0;
         }
@@ -157,6 +180,16 @@ void main() {
             }
         }
 
+        if (uniform_w) {
+            // same matrix type and shape, so element i of both refers to the same (key, token)
+            [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
+                [[unroll]] for (uint i = 0; i < relu_sum[c].length(); ++i) {
+                    relu_sum[c][i] += max(acc[c][i], 0.0);
+                }
+            }
+            continue;
+        }
+
         // column-major store: element (key, token) lands at token * S_STRIDE + key
         [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
             coopMatStore(acc[c], s_sh, (c * 16) * S_STRIDE + sg * 16, S_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
@@ -169,6 +202,18 @@ void main() {
             const uint kl = e % BK;
             const uint tl = e / BK;
             score[j] += max(s_sh[tl * S_STRIDE + kl], 0.0) * w_sh[tl];
+        }
+    }
+
+    if (uniform_w) {
+        // s_sh is free: the non-uniform path never ran
+        [[unroll]] for (uint c = 0; c < BT / 16; ++c) {
+            coopMatStore(relu_sum[c], s_sh, (c * 16) * S_STRIDE + sg * 16, S_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+        barrier();
+        [[unroll]] for (uint j = 0; j < EPT; ++j) {
+            const uint e = j * WG_SIZE + tid;
+            score[j] = s_sh[(e / BK) * S_STRIDE + e % BK] * w0;
         }
     }
 

@@ -9946,9 +9946,10 @@ struct test_lightning_indexer : public test_case {
     const int64_t nm; // ne[3] of mask
 
     const ggml_type type_K;
+    const bool w_const; // every head weight 1/sqrt(hsk), as Qwen QSA uses it
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, w_const);
     }
 
     double max_nmse_err() override {
@@ -9960,8 +9961,8 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16, bool w_const = false)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), w_const(w_const) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -9990,6 +9991,9 @@ struct test_lightning_indexer : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (w_const && strcmp(t->name, "w") == 0) {
+                std::vector<float> v(ggml_nelements(t), 1.0f / sqrtf((float) hsk));
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -13903,6 +13907,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+    // constant head weights (the QSA case): 1, 2 and 4 token tiles, partial key and token tiles, two streams
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 300, 33, 1, 1, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 4100, 130, 2, 2, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_lightning_indexer(128, 8, 1000, 70, 1, 1, GGML_TYPE_BF16, true));
 
     return test_cases;
 }
@@ -14581,6 +14590,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 for (int ns : { 1, 4 }) {
                     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                         test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, ns, ns, type_K));
+                        if (nh == 4) { test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, ns, ns, type_K, true)); }
                     }
                 }
             }
